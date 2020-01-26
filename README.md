@@ -4,6 +4,8 @@ unagi development team / 2009.10.08
 
 firmware version 0.1.3 / 2010.03.13
 
+some fix to compile on avr-gcc 9.2.0 by muraguchi
+
 ## features
 
 - USB-to-PC communication
