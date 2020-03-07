@@ -1,0 +1,1973 @@
+   1               		.file	"flashmemory.c"
+   2               	__SP_H__ = 0x3e
+   3               	__SP_L__ = 0x3d
+   4               	__SREG__ = 0x3f
+   5               	__tmp_reg__ = 0
+   6               	__zero_reg__ = 1
+   7               		.text
+   8               	.Ltext0:
+   9               		.cfi_sections	.debug_frame
+  11               	command_execute:
+  12               	.LVL0:
+  13               	.LFB19:
+  14               		.file 1 "flashmemory.c"
+   1:flashmemory.c **** #include <stdint.h>
+   2:flashmemory.c **** //#include <avr/interrupt.h>
+   3:flashmemory.c **** #include "kazzo_task.h"
+   4:flashmemory.c **** #include "bus_access.h"
+   5:flashmemory.c **** 
+   6:flashmemory.c **** //---- global variable ----
+   7:flashmemory.c **** struct flash_seqence{
+   8:flashmemory.c **** 	void (*const writer)(uint16_t address, uint16_t length, const uint8_t *data);
+   9:flashmemory.c **** 	void (*const programmer)(const struct flash_order *t);
+  10:flashmemory.c **** 	void (*const reader)(uint16_t address, uint16_t length, uint8_t *data);
+  11:flashmemory.c **** 	enum compare_status (*const compare)(uint16_t address, uint16_t length, const uint8_t *data);
+  12:flashmemory.c **** 	enum status{
+  13:flashmemory.c **** 		IDLE = KAZZO_TASK_FLASH_IDLE, 
+  14:flashmemory.c **** 		ERASE, ERASE_WAIT,
+  15:flashmemory.c **** 		PROGRAM, TOGGLE_FIRST, TOGGLE_CHECK
+  16:flashmemory.c **** 	} status, request;
+  17:flashmemory.c **** 	uint16_t command_000x, command_2aaa, command_5555;
+  18:flashmemory.c **** 	uint8_t retry_enable;
+  19:flashmemory.c **** 	uint16_t address, length, program_unit;
+  20:flashmemory.c **** 	const uint8_t *data;
+  21:flashmemory.c **** 	uint8_t toggle, retry_count;
+  22:flashmemory.c **** 	struct flash_order program_command[FLASH_PROGRAM_ORDER];
+  23:flashmemory.c **** };
+  24:flashmemory.c **** static struct flash_seqence seqence_cpu = {
+  25:flashmemory.c **** 	.status = IDLE, .reader = cpu_read, 
+  26:flashmemory.c **** 	.writer = cpu_write_flash, .programmer = cpu_write_flash_order,
+  27:flashmemory.c **** 	.compare = cpu_compare
+  28:flashmemory.c **** };
+  29:flashmemory.c **** static struct flash_seqence seqence_ppu = {
+  30:flashmemory.c **** 	.status = IDLE, .reader = ppu_read, 
+  31:flashmemory.c **** 	.writer = ppu_write, .programmer = ppu_write_order,
+  32:flashmemory.c **** 	.compare = ppu_compare
+  33:flashmemory.c **** };
+  34:flashmemory.c **** 
+  35:flashmemory.c **** //---- task registration ----
+  36:flashmemory.c **** uint8_t flash_cpu_status(void)
+  37:flashmemory.c **** {
+  38:flashmemory.c **** 	return seqence_cpu.status;
+  39:flashmemory.c **** }
+  40:flashmemory.c **** uint8_t flash_ppu_status(void)
+  41:flashmemory.c **** {
+  42:flashmemory.c **** 	return seqence_ppu.status;
+  43:flashmemory.c **** }
+  44:flashmemory.c **** void flash_both_idle(void)
+  45:flashmemory.c **** {
+  46:flashmemory.c **** 	seqence_cpu.status = IDLE;
+  47:flashmemory.c **** 	seqence_ppu.status = IDLE;
+  48:flashmemory.c **** }
+  49:flashmemory.c **** static inline uint16_t unpack_short_le(const uint8_t *t)
+  50:flashmemory.c **** {
+  51:flashmemory.c **** 	uint16_t r = t[0];
+  52:flashmemory.c **** 	r |= t[1] << 8;
+  53:flashmemory.c **** 	return r;
+  54:flashmemory.c **** }
+  55:flashmemory.c **** static void config_set(const uint8_t *data, uint16_t length, struct flash_seqence *t)
+  56:flashmemory.c **** {
+  57:flashmemory.c **** 	t->command_000x = unpack_short_le(data);
+  58:flashmemory.c **** 	data += sizeof(uint16_t);
+  59:flashmemory.c **** 	t->command_2aaa = unpack_short_le(data);
+  60:flashmemory.c **** 	data += sizeof(uint16_t);
+  61:flashmemory.c **** 	t->command_5555 = unpack_short_le(data);
+  62:flashmemory.c **** 	data += sizeof(uint16_t);
+  63:flashmemory.c **** 	t->program_unit = unpack_short_le(data);
+  64:flashmemory.c **** 	data += sizeof(uint16_t);
+  65:flashmemory.c **** 	if(length < 9){ //support client 0.6.0
+  66:flashmemory.c **** 		t->retry_enable = 0;
+  67:flashmemory.c **** 	}else{
+  68:flashmemory.c **** 		t->retry_enable = *data;
+  69:flashmemory.c **** 	}
+  70:flashmemory.c **** 
+  71:flashmemory.c **** 	t->program_command[0].address = t->command_5555;
+  72:flashmemory.c **** 	t->program_command[0].data = 0xaa;
+  73:flashmemory.c **** 	t->program_command[1].address = t->command_2aaa;
+  74:flashmemory.c **** 	t->program_command[1].data = 0x55;
+  75:flashmemory.c **** 	t->program_command[2].address = t->command_5555;
+  76:flashmemory.c **** 	t->program_command[2].data = 0xa0;
+  77:flashmemory.c **** };
+  78:flashmemory.c **** void flash_cpu_config(const uint8_t *data, uint16_t length)
+  79:flashmemory.c **** {
+  80:flashmemory.c **** 	config_set(data, length, &seqence_cpu);
+  81:flashmemory.c **** }
+  82:flashmemory.c **** void flash_ppu_config(const uint8_t *data, uint16_t length)
+  83:flashmemory.c **** {
+  84:flashmemory.c **** 	config_set(data, length, &seqence_ppu);
+  85:flashmemory.c **** }
+  86:flashmemory.c **** 
+  87:flashmemory.c **** static void program_assign(enum status status, uint16_t address, uint16_t length, const uint8_t *da
+  88:flashmemory.c **** {
+  89:flashmemory.c **** 	if(0 && (t->program_unit != 1) && (t->status == PROGRAM)){ //W29C040 ¤ÎºÆ½ñ¤­¹þ¤ß²ó¿ô¤ò¸º¤é¤·¤Æ¤ß¤
+  90:flashmemory.c **** 		t->status = TOGGLE_FIRST;
+  91:flashmemory.c **** 	}else{
+  92:flashmemory.c **** 		t->status = status;
+  93:flashmemory.c **** 	}
+  94:flashmemory.c **** 	t->request = status;
+  95:flashmemory.c **** 	t->address = address;
+  96:flashmemory.c **** 	t->length = length;
+  97:flashmemory.c **** 	t->data = data;
+  98:flashmemory.c **** 	t->retry_count = 0;
+  99:flashmemory.c **** }
+ 100:flashmemory.c **** void flash_cpu_program(uint16_t address, uint16_t length, const uint8_t *data)
+ 101:flashmemory.c **** {
+ 102:flashmemory.c **** 	program_assign(PROGRAM, address, length, data, &seqence_cpu);
+ 103:flashmemory.c **** }
+ 104:flashmemory.c **** void flash_ppu_program(uint16_t address, uint16_t length, const uint8_t *data)
+ 105:flashmemory.c **** {
+ 106:flashmemory.c **** 	program_assign(PROGRAM, address, length, data, &seqence_ppu);
+ 107:flashmemory.c **** }
+ 108:flashmemory.c **** #define NULL (0)
+ 109:flashmemory.c **** void flash_cpu_erase(uint16_t address)
+ 110:flashmemory.c **** {
+ 111:flashmemory.c **** 	//length ¤Ë unit ¤òÅÏ¤·¤Æ toggle check ¸å IDLE ¤Ë¤Ê¤ë¤è¤¦¤Ë¤¹¤ë
+ 112:flashmemory.c **** 	program_assign(ERASE, address, seqence_cpu.program_unit, NULL, &seqence_cpu);
+ 113:flashmemory.c **** }
+ 114:flashmemory.c **** void flash_ppu_erase(uint16_t address)
+ 115:flashmemory.c **** {
+ 116:flashmemory.c **** 	program_assign(ERASE, address, seqence_ppu.program_unit, NULL, &seqence_ppu);
+ 117:flashmemory.c **** }
+ 118:flashmemory.c **** 
+ 119:flashmemory.c **** //---- command write ----
+ 120:flashmemory.c **** struct flash_command{
+ 121:flashmemory.c **** 	enum {C2AAA, C5555, END} address;
+ 122:flashmemory.c **** 	uint8_t data;
+ 123:flashmemory.c **** };
+ 124:flashmemory.c **** static void command_execute(const struct flash_command *c, const struct flash_seqence *const t)
+ 125:flashmemory.c **** {
+  15               		.loc 1 125 1 view -0
+  16               		.cfi_startproc
+  17               		.loc 1 125 1 is_stmt 0 view .LVU1
+  18 0000 0F93      		push r16
+  19               	.LCFI0:
+  20               		.cfi_def_cfa_offset 3
+  21               		.cfi_offset 16, -2
+  22 0002 1F93      		push r17
+  23               	.LCFI1:
+  24               		.cfi_def_cfa_offset 4
+  25               		.cfi_offset 17, -3
+  26 0004 CF93      		push r28
+  27               	.LCFI2:
+  28               		.cfi_def_cfa_offset 5
+  29               		.cfi_offset 28, -4
+  30 0006 DF93      		push r29
+  31               	.LCFI3:
+  32               		.cfi_def_cfa_offset 6
+  33               		.cfi_offset 29, -5
+  34               	/* prologue: function */
+  35               	/* frame size = 0 */
+  36               	/* stack size = 4 */
+  37               	.L__stack_usage = 4
+  38 0008 EC01      		movw r28,r24
+  39 000a 8B01      		movw r16,r22
+ 126:flashmemory.c **** 	while(c->address != END){
+  40               		.loc 1 126 2 is_stmt 1 view .LVU2
+  41               		.loc 1 126 7 view .LVU3
+  42               		.loc 1 126 9 is_stmt 0 view .LVU4
+  43 000c 8881      		ld r24,Y
+  44               	.LVL1:
+  45               		.loc 1 126 7 view .LVU5
+  46 000e 8230      		cpi r24,lo8(2)
+  47 0010 01F0      		breq .L1
+  48 0012 2196      		adiw r28,1
+  49               	.LVL2:
+  50               		.loc 1 126 7 view .LVU6
+  51 0014 00C0      		rjmp .L6
+  52               	.LVL3:
+  53               	.L4:
+  54               	.LBB26:
+ 127:flashmemory.c **** 		uint16_t addr = 0;
+ 128:flashmemory.c **** 		switch(c->address){
+ 129:flashmemory.c **** 		case C2AAA:
+ 130:flashmemory.c **** 			addr = t->command_2aaa;
+ 131:flashmemory.c **** 			break;
+ 132:flashmemory.c **** 		case C5555:
+ 133:flashmemory.c **** 			addr = t->command_5555;
+  55               		.loc 1 133 4 is_stmt 1 view .LVU7
+  56               		.loc 1 133 9 is_stmt 0 view .LVU8
+  57 0016 F801      		movw r30,r16
+  58 0018 8685      		ldd r24,Z+14
+  59 001a 9785      		ldd r25,Z+15
+  60               	.LVL4:
+ 134:flashmemory.c **** 			break;
+  61               		.loc 1 134 4 is_stmt 1 view .LVU9
+  62               	.L5:
+ 135:flashmemory.c **** 		case END:
+ 136:flashmemory.c **** 			return;
+ 137:flashmemory.c **** 		}
+ 138:flashmemory.c **** 		t->writer(addr, 1, &c->data);
+  63               		.loc 1 138 3 view .LVU10
+  64 001c D801      		movw r26,r16
+  65 001e ED91      		ld r30,X+
+  66 0020 FC91      		ld r31,X
+  67 0022 AE01      		movw r20,r28
+  68 0024 61E0      		ldi r22,lo8(1)
+  69 0026 70E0      		ldi r23,0
+  70 0028 0995      		icall
+  71               	.LVL5:
+ 139:flashmemory.c **** 		c++;
+  72               		.loc 1 139 3 view .LVU11
+  73               		.loc 1 139 3 is_stmt 0 view .LVU12
+  74               	.LBE26:
+ 126:flashmemory.c **** 		uint16_t addr = 0;
+  75               		.loc 1 126 7 is_stmt 1 view .LVU13
+  76 002a 2296      		adiw r28,2
+  77               	.LVL6:
+ 126:flashmemory.c **** 		uint16_t addr = 0;
+  78               		.loc 1 126 9 is_stmt 0 view .LVU14
+  79 002c FE01      		movw r30,r28
+  80 002e 3197      		sbiw r30,1
+  81 0030 8081      		ld r24,Z
+ 126:flashmemory.c **** 		uint16_t addr = 0;
+  82               		.loc 1 126 7 view .LVU15
+  83 0032 8230      		cpi r24,lo8(2)
+  84 0034 01F0      		breq .L1
+  85               	.LVL7:
+  86               	.L6:
+  87               	.LBB27:
+ 127:flashmemory.c **** 		switch(c->address){
+  88               		.loc 1 127 3 is_stmt 1 view .LVU16
+ 128:flashmemory.c **** 		case C2AAA:
+  89               		.loc 1 128 3 view .LVU17
+  90 0036 8823      		tst r24
+  91 0038 01F0      		breq .L3
+  92 003a 8130      		cpi r24,lo8(1)
+  93 003c 01F0      		breq .L4
+  94 003e 90E0      		ldi r25,0
+  95 0040 80E0      		ldi r24,0
+  96 0042 00C0      		rjmp .L5
+  97               	.L3:
+ 130:flashmemory.c **** 			break;
+  98               		.loc 1 130 4 view .LVU18
+ 130:flashmemory.c **** 			break;
+  99               		.loc 1 130 9 is_stmt 0 view .LVU19
+ 100 0044 D801      		movw r26,r16
+ 101 0046 1C96      		adiw r26,12
+ 102 0048 8D91      		ld r24,X+
+ 103 004a 9C91      		ld r25,X
+ 104               	.LVL8:
+ 131:flashmemory.c **** 		case C5555:
+ 105               		.loc 1 131 4 is_stmt 1 view .LVU20
+ 106 004c 00C0      		rjmp .L5
+ 107               	.LVL9:
+ 108               	.L1:
+ 109               	/* epilogue start */
+ 131:flashmemory.c **** 		case C5555:
+ 110               		.loc 1 131 4 is_stmt 0 view .LVU21
+ 111               	.LBE27:
+ 140:flashmemory.c **** 	}
+ 141:flashmemory.c **** }
+ 112               		.loc 1 141 1 view .LVU22
+ 113 004e DF91      		pop r29
+ 114 0050 CF91      		pop r28
+ 115 0052 1F91      		pop r17
+ 116 0054 0F91      		pop r16
+ 117               	.LVL10:
+ 118               		.loc 1 141 1 view .LVU23
+ 119 0056 0895      		ret
+ 120               		.cfi_endproc
+ 121               	.LFE19:
+ 124               	device_get:
+ 125               	.LVL11:
+ 126               	.LFB22:
+ 142:flashmemory.c **** static void program(const struct flash_seqence *t)
+ 143:flashmemory.c **** {
+ 144:flashmemory.c **** /*	static const struct flash_command c[] = {
+ 145:flashmemory.c **** 		{C5555, 0xaa}, {C2AAA, 0x55}, {C5555, 0xa0}, {END, 0}
+ 146:flashmemory.c **** 	};
+ 147:flashmemory.c **** 	command_execute(c, t);*/
+ 148:flashmemory.c **** 	t->programmer(t->program_command);
+ 149:flashmemory.c **** 	t->writer(t->address, t->program_unit, t->data);
+ 150:flashmemory.c **** }
+ 151:flashmemory.c **** 
+ 152:flashmemory.c **** static void erase(const struct flash_seqence *t)
+ 153:flashmemory.c **** {
+ 154:flashmemory.c **** 	static const struct flash_command c[] = {
+ 155:flashmemory.c **** 		{C5555, 0xaa}, {C2AAA, 0x55}, {C5555, 0x80}, 
+ 156:flashmemory.c **** 		{C5555, 0xaa}, {C2AAA, 0x55}, {C5555, 0x10}, 
+ 157:flashmemory.c **** 		{END, 0}
+ 158:flashmemory.c **** 	};
+ 159:flashmemory.c **** 	command_execute(c, t);
+ 160:flashmemory.c **** }
+ 161:flashmemory.c **** 
+ 162:flashmemory.c **** static void device_get(const struct flash_seqence *t, uint8_t d[2])
+ 163:flashmemory.c **** {
+ 127               		.loc 1 163 1 is_stmt 1 view -0
+ 128               		.cfi_startproc
+ 129               		.loc 1 163 1 is_stmt 0 view .LVU25
+ 130 0058 0F93      		push r16
+ 131               	.LCFI4:
+ 132               		.cfi_def_cfa_offset 3
+ 133               		.cfi_offset 16, -2
+ 134 005a 1F93      		push r17
+ 135               	.LCFI5:
+ 136               		.cfi_def_cfa_offset 4
+ 137               		.cfi_offset 17, -3
+ 138 005c CF93      		push r28
+ 139               	.LCFI6:
+ 140               		.cfi_def_cfa_offset 5
+ 141               		.cfi_offset 28, -4
+ 142 005e DF93      		push r29
+ 143               	.LCFI7:
+ 144               		.cfi_def_cfa_offset 6
+ 145               		.cfi_offset 29, -5
+ 146               	/* prologue: function */
+ 147               	/* frame size = 0 */
+ 148               	/* stack size = 4 */
+ 149               	.L__stack_usage = 4
+ 150 0060 EC01      		movw r28,r24
+ 151 0062 8B01      		movw r16,r22
+ 164:flashmemory.c **** 	static const struct flash_command entry[] = {
+ 152               		.loc 1 164 2 is_stmt 1 view .LVU26
+ 165:flashmemory.c **** 		{C5555, 0xaa}, {C2AAA, 0x55}, {C5555, 0x90}, {END, 0}
+ 166:flashmemory.c **** 	};
+ 167:flashmemory.c **** 	static const struct flash_command exit[] = {
+ 153               		.loc 1 167 2 view .LVU27
+ 168:flashmemory.c **** 		{C5555, 0xaa}, {C2AAA, 0x55}, {C5555, 0xf0}, {END, 0}
+ 169:flashmemory.c **** 	};
+ 170:flashmemory.c **** 	command_execute(entry, t);
+ 154               		.loc 1 170 2 view .LVU28
+ 155 0064 BC01      		movw r22,r24
+ 156               	.LVL12:
+ 157               		.loc 1 170 2 is_stmt 0 view .LVU29
+ 158 0066 80E0      		ldi r24,lo8(entry.1792)
+ 159 0068 90E0      		ldi r25,hi8(entry.1792)
+ 160               	.LVL13:
+ 161               		.loc 1 170 2 view .LVU30
+ 162 006a 0E94 0000 		call command_execute
+ 163               	.LVL14:
+ 171:flashmemory.c **** 	t->reader(t->command_000x, 1, d);
+ 164               		.loc 1 171 2 is_stmt 1 view .LVU31
+ 165 006e EC81      		ldd r30,Y+4
+ 166 0070 FD81      		ldd r31,Y+5
+ 167 0072 A801      		movw r20,r16
+ 168 0074 61E0      		ldi r22,lo8(1)
+ 169 0076 70E0      		ldi r23,0
+ 170 0078 8A85      		ldd r24,Y+10
+ 171 007a 9B85      		ldd r25,Y+11
+ 172 007c 0995      		icall
+ 173               	.LVL15:
+ 172:flashmemory.c **** 	command_execute(entry, t);
+ 174               		.loc 1 172 2 view .LVU32
+ 175 007e BE01      		movw r22,r28
+ 176 0080 80E0      		ldi r24,lo8(entry.1792)
+ 177 0082 90E0      		ldi r25,hi8(entry.1792)
+ 178 0084 0E94 0000 		call command_execute
+ 179               	.LVL16:
+ 173:flashmemory.c **** 	t->reader(t->command_000x + 1, 1, d + 1);
+ 180               		.loc 1 173 2 view .LVU33
+ 181 0088 A801      		movw r20,r16
+ 182 008a 4F5F      		subi r20,-1
+ 183 008c 5F4F      		sbci r21,-1
+ 184 008e 8A85      		ldd r24,Y+10
+ 185 0090 9B85      		ldd r25,Y+11
+ 186 0092 EC81      		ldd r30,Y+4
+ 187 0094 FD81      		ldd r31,Y+5
+ 188 0096 61E0      		ldi r22,lo8(1)
+ 189 0098 70E0      		ldi r23,0
+ 190 009a 0196      		adiw r24,1
+ 191 009c 0995      		icall
+ 192               	.LVL17:
+ 174:flashmemory.c **** 	command_execute(exit, t);
+ 193               		.loc 1 174 2 view .LVU34
+ 194 009e BE01      		movw r22,r28
+ 195 00a0 80E0      		ldi r24,lo8(exit.1793)
+ 196 00a2 90E0      		ldi r25,hi8(exit.1793)
+ 197               	/* epilogue start */
+ 175:flashmemory.c **** }
+ 198               		.loc 1 175 1 is_stmt 0 view .LVU35
+ 199 00a4 DF91      		pop r29
+ 200 00a6 CF91      		pop r28
+ 201               	.LVL18:
+ 202               		.loc 1 175 1 view .LVU36
+ 203 00a8 1F91      		pop r17
+ 204 00aa 0F91      		pop r16
+ 205               	.LVL19:
+ 174:flashmemory.c **** 	command_execute(exit, t);
+ 206               		.loc 1 174 2 view .LVU37
+ 207 00ac 0C94 0000 		jmp command_execute
+ 208               	.LVL20:
+ 174:flashmemory.c **** 	command_execute(exit, t);
+ 209               		.loc 1 174 2 view .LVU38
+ 210               		.cfi_endproc
+ 211               	.LFE22:
+ 214               	process:
+ 215               	.LVL21:
+ 216               	.LFB28:
+ 176:flashmemory.c **** void flash_cpu_device_get(uint8_t d[2])
+ 177:flashmemory.c **** {
+ 178:flashmemory.c **** 	device_get(&seqence_cpu, d);
+ 179:flashmemory.c **** }
+ 180:flashmemory.c **** void flash_ppu_device_get(uint8_t d[2])
+ 181:flashmemory.c **** {
+ 182:flashmemory.c **** 	device_get(&seqence_ppu, d);
+ 183:flashmemory.c **** }
+ 184:flashmemory.c **** //---- status read ----
+ 185:flashmemory.c **** static void toggle_first(struct flash_seqence *t)
+ 186:flashmemory.c **** {
+ 187:flashmemory.c **** 	t->reader(t->address, 1, &t->toggle);
+ 188:flashmemory.c **** 	t->toggle &= 0x40;
+ 189:flashmemory.c **** }
+ 190:flashmemory.c **** static void toggle_check(struct flash_seqence *t)
+ 191:flashmemory.c **** {
+ 192:flashmemory.c **** 	uint8_t d;
+ 193:flashmemory.c **** 	t->reader(t->address, 1, &d);
+ 194:flashmemory.c **** 	if(t->toggle == (d & 0x40)){
+ 195:flashmemory.c **** 		if((t->retry_enable != 0) && (t->request == PROGRAM) && (t->retry_count < 20)){
+ 196:flashmemory.c **** 			if(t->compare(t->address, t->program_unit, t->data) == NG){
+ 197:flashmemory.c **** 				t->retry_count += 1;
+ 198:flashmemory.c **** 				t->status = PROGRAM;
+ 199:flashmemory.c **** 				return;
+ 200:flashmemory.c **** 			}
+ 201:flashmemory.c **** 		}
+ 202:flashmemory.c **** 		t->retry_count = 0;
+ 203:flashmemory.c **** 		t->address += t->program_unit;
+ 204:flashmemory.c **** 		t->data += t->program_unit;
+ 205:flashmemory.c **** 		t->length -= t->program_unit;
+ 206:flashmemory.c **** 		if((t->length == 0) || (t->request == ERASE)){
+ 207:flashmemory.c **** 			t->status = IDLE;
+ 208:flashmemory.c **** 		}else{
+ 209:flashmemory.c **** 			t->status = PROGRAM;
+ 210:flashmemory.c **** 		}
+ 211:flashmemory.c **** 	}
+ 212:flashmemory.c **** 	t->toggle = d & 0x40;
+ 213:flashmemory.c **** 	if(0 && (d & 0x20)){ //polling DQ5, AM29F040B only
+ 214:flashmemory.c **** 		uint8_t d0, d1;
+ 215:flashmemory.c **** 		t->reader(t->address, 1, &d0);
+ 216:flashmemory.c **** 		t->reader(t->address, 1, &d1);
+ 217:flashmemory.c **** 		if((d0 & 0x40) == (d1 & 0x40)){
+ 218:flashmemory.c **** 			t->address += t->program_unit;
+ 219:flashmemory.c **** 			t->data += t->program_unit;
+ 220:flashmemory.c **** 			t->length -= t->program_unit;
+ 221:flashmemory.c **** 			if((t->length == 0) || (t->request == ERASE)){
+ 222:flashmemory.c **** 				t->status = IDLE;
+ 223:flashmemory.c **** 			}else{
+ 224:flashmemory.c **** 				t->status = PROGRAM;
+ 225:flashmemory.c **** 			}
+ 226:flashmemory.c **** 		}
+ 227:flashmemory.c **** 	}
+ 228:flashmemory.c **** }
+ 229:flashmemory.c **** 
+ 230:flashmemory.c **** static void erase_wait(struct flash_seqence *t)
+ 231:flashmemory.c **** {
+ 232:flashmemory.c **** 	uint8_t d;
+ 233:flashmemory.c **** 	t->reader(t->address, 1, &d);
+ 234:flashmemory.c **** 	if(d == 0xff){
+ 235:flashmemory.c **** 		t->status = IDLE;
+ 236:flashmemory.c **** 	}
+ 237:flashmemory.c **** }
+ 238:flashmemory.c **** //---- task execute ----
+ 239:flashmemory.c **** static void process(struct flash_seqence *s)
+ 240:flashmemory.c **** {
+ 217               		.loc 1 240 1 is_stmt 1 view -0
+ 218               		.cfi_startproc
+ 219               		.loc 1 240 1 is_stmt 0 view .LVU40
+ 220 00b0 FF92      		push r15
+ 221               	.LCFI8:
+ 222               		.cfi_def_cfa_offset 3
+ 223               		.cfi_offset 15, -2
+ 224 00b2 0F93      		push r16
+ 225               	.LCFI9:
+ 226               		.cfi_def_cfa_offset 4
+ 227               		.cfi_offset 16, -3
+ 228 00b4 1F93      		push r17
+ 229               	.LCFI10:
+ 230               		.cfi_def_cfa_offset 5
+ 231               		.cfi_offset 17, -4
+ 232 00b6 CF93      		push r28
+ 233               	.LCFI11:
+ 234               		.cfi_def_cfa_offset 6
+ 235               		.cfi_offset 28, -5
+ 236 00b8 DF93      		push r29
+ 237               	.LCFI12:
+ 238               		.cfi_def_cfa_offset 7
+ 239               		.cfi_offset 29, -6
+ 240 00ba 0F92      		push __tmp_reg__
+ 241               	.LCFI13:
+ 242               		.cfi_def_cfa_offset 8
+ 243 00bc CDB7      		in r28,__SP_L__
+ 244 00be DEB7      		in r29,__SP_H__
+ 245               	.LCFI14:
+ 246               		.cfi_def_cfa_register 28
+ 247               	/* prologue: function */
+ 248               	/* frame size = 1 */
+ 249               	/* stack size = 6 */
+ 250               	.L__stack_usage = 6
+ 251 00c0 8C01      		movw r16,r24
+ 241:flashmemory.c **** 	switch(s->status){
+ 252               		.loc 1 241 2 is_stmt 1 view .LVU41
+ 253               		.loc 1 241 10 is_stmt 0 view .LVU42
+ 254 00c2 DC01      		movw r26,r24
+ 255 00c4 1896      		adiw r26,8
+ 256 00c6 8C91      		ld r24,X
+ 257 00c8 1897      		sbiw r26,8
+ 258               	.LVL22:
+ 259               		.loc 1 241 2 view .LVU43
+ 260 00ca 8330      		cpi r24,lo8(3)
+ 261 00cc 01F4      		brne .+2
+ 262 00ce 00C0      		rjmp .L14
+ 263 00d0 00F0      		brlo .L38
+ 264 00d2 8430      		cpi r24,lo8(4)
+ 265 00d4 01F4      		brne .+2
+ 266 00d6 00C0      		rjmp .L19
+ 267 00d8 8530      		cpi r24,lo8(5)
+ 268 00da 01F4      		brne .L13
+ 242:flashmemory.c **** 	case IDLE:
+ 243:flashmemory.c **** 		break;
+ 244:flashmemory.c **** 	case ERASE:
+ 245:flashmemory.c **** 		erase(s);
+ 246:flashmemory.c **** 		s->status = ERASE_WAIT;
+ 247:flashmemory.c **** 		break;
+ 248:flashmemory.c **** 	case ERASE_WAIT:
+ 249:flashmemory.c **** 		erase_wait(s);
+ 250:flashmemory.c **** 		break;
+ 251:flashmemory.c **** 	case PROGRAM:
+ 252:flashmemory.c **** 		if((s->program_unit != 1) || (*(s->data) != 0xff)){
+ 253:flashmemory.c **** 			program(s);
+ 254:flashmemory.c **** 		}
+ 255:flashmemory.c **** 		s->status = TOGGLE_FIRST;
+ 256:flashmemory.c **** 		break;
+ 257:flashmemory.c **** 	case TOGGLE_FIRST:
+ 258:flashmemory.c **** 		toggle_first(s);
+ 259:flashmemory.c **** 		s->status = TOGGLE_CHECK;
+ 260:flashmemory.c **** 		break;
+ 261:flashmemory.c **** 	case TOGGLE_CHECK:
+ 262:flashmemory.c **** 		toggle_check(s); //status is updated by function
+ 269               		.loc 1 262 3 is_stmt 1 view .LVU44
+ 270               	.LVL23:
+ 271               	.LBB38:
+ 272               	.LBI38:
+ 190:flashmemory.c **** {
+ 273               		.loc 1 190 13 view .LVU45
+ 274               	.LBB39:
+ 192:flashmemory.c **** 	t->reader(t->address, 1, &d);
+ 275               		.loc 1 192 2 view .LVU46
+ 193:flashmemory.c **** 	if(t->toggle == (d & 0x40)){
+ 276               		.loc 1 193 2 view .LVU47
+ 277 00dc 1496      		adiw r26,4
+ 278 00de ED91      		ld r30,X+
+ 279 00e0 FC91      		ld r31,X
+ 280 00e2 1597      		sbiw r26,4+1
+ 281 00e4 AE01      		movw r20,r28
+ 282 00e6 4F5F      		subi r20,-1
+ 283 00e8 5F4F      		sbci r21,-1
+ 284 00ea 61E0      		ldi r22,lo8(1)
+ 285 00ec 70E0      		ldi r23,0
+ 286 00ee 5196      		adiw r26,17
+ 287 00f0 8D91      		ld r24,X+
+ 288 00f2 9C91      		ld r25,X
+ 289 00f4 0995      		icall
+ 290               	.LVL24:
+ 194:flashmemory.c **** 		if((t->retry_enable != 0) && (t->request == PROGRAM) && (t->retry_count < 20)){
+ 291               		.loc 1 194 2 view .LVU48
+ 292 00f6 9981      		ldd r25,Y+1
+ 293 00f8 892F      		mov r24,r25
+ 294 00fa 8074      		andi r24,lo8(64)
+ 194:flashmemory.c **** 		if((t->retry_enable != 0) && (t->request == PROGRAM) && (t->retry_count < 20)){
+ 295               		.loc 1 194 4 is_stmt 0 view .LVU49
+ 296 00fc F801      		movw r30,r16
+ 297 00fe 218D      		ldd r18,Z+25
+ 298 0100 2817      		cp r18,r24
+ 299 0102 01F0      		breq .L39
+ 300               	.L24:
+ 212:flashmemory.c **** 	if(0 && (d & 0x20)){ //polling DQ5, AM29F040B only
+ 301               		.loc 1 212 2 is_stmt 1 view .LVU50
+ 212:flashmemory.c **** 	if(0 && (d & 0x20)){ //polling DQ5, AM29F040B only
+ 302               		.loc 1 212 12 is_stmt 0 view .LVU51
+ 303 0104 D801      		movw r26,r16
+ 304 0106 5996      		adiw r26,25
+ 305 0108 8C93      		st X,r24
+ 213:flashmemory.c **** 		uint8_t d0, d1;
+ 306               		.loc 1 213 2 is_stmt 1 view .LVU52
+ 307               	.LVL25:
+ 308               	.L13:
+ 309               	/* epilogue start */
+ 213:flashmemory.c **** 		uint8_t d0, d1;
+ 310               		.loc 1 213 2 is_stmt 0 view .LVU53
+ 311               	.LBE39:
+ 312               	.LBE38:
+ 263:flashmemory.c **** 		break;
+ 264:flashmemory.c **** 	}
+ 265:flashmemory.c **** 
+ 266:flashmemory.c **** }
+ 313               		.loc 1 266 1 view .LVU54
+ 314 010a 0F90      		pop __tmp_reg__
+ 315 010c DF91      		pop r29
+ 316 010e CF91      		pop r28
+ 317 0110 1F91      		pop r17
+ 318 0112 0F91      		pop r16
+ 319               	.LVL26:
+ 320               		.loc 1 266 1 view .LVU55
+ 321 0114 FF90      		pop r15
+ 322 0116 0895      		ret
+ 323               	.LVL27:
+ 324               	.L38:
+ 241:flashmemory.c **** 	case IDLE:
+ 325               		.loc 1 241 2 view .LVU56
+ 326 0118 8130      		cpi r24,lo8(1)
+ 327 011a 01F4      		brne .+2
+ 328 011c 00C0      		rjmp .L16
+ 329 011e 8230      		cpi r24,lo8(2)
+ 330 0120 01F4      		brne .L13
+ 249:flashmemory.c **** 		break;
+ 331               		.loc 1 249 3 is_stmt 1 view .LVU57
+ 332               	.LVL28:
+ 333               	.LBB42:
+ 334               	.LBI42:
+ 230:flashmemory.c **** {
+ 335               		.loc 1 230 13 view .LVU58
+ 336               	.LBB43:
+ 232:flashmemory.c **** 	t->reader(t->address, 1, &d);
+ 337               		.loc 1 232 2 view .LVU59
+ 233:flashmemory.c **** 	if(d == 0xff){
+ 338               		.loc 1 233 2 view .LVU60
+ 339 0122 1496      		adiw r26,4
+ 340 0124 ED91      		ld r30,X+
+ 341 0126 FC91      		ld r31,X
+ 342 0128 1597      		sbiw r26,4+1
+ 343 012a AE01      		movw r20,r28
+ 344 012c 4F5F      		subi r20,-1
+ 345 012e 5F4F      		sbci r21,-1
+ 346 0130 61E0      		ldi r22,lo8(1)
+ 347 0132 70E0      		ldi r23,0
+ 348 0134 5196      		adiw r26,17
+ 349 0136 8D91      		ld r24,X+
+ 350 0138 9C91      		ld r25,X
+ 351 013a 0995      		icall
+ 352               	.LVL29:
+ 234:flashmemory.c **** 		t->status = IDLE;
+ 353               		.loc 1 234 2 view .LVU61
+ 234:flashmemory.c **** 		t->status = IDLE;
+ 354               		.loc 1 234 4 is_stmt 0 view .LVU62
+ 355 013c 8981      		ldd r24,Y+1
+ 356 013e 8F3F      		cpi r24,lo8(-1)
+ 357 0140 01F4      		brne .L13
+ 235:flashmemory.c **** 	}
+ 358               		.loc 1 235 3 is_stmt 1 view .LVU63
+ 235:flashmemory.c **** 	}
+ 359               		.loc 1 235 13 is_stmt 0 view .LVU64
+ 360 0142 F801      		movw r30,r16
+ 361 0144 1086      		std Z+8,__zero_reg__
+ 237:flashmemory.c **** //---- task execute ----
+ 362               		.loc 1 237 1 view .LVU65
+ 363 0146 00C0      		rjmp .L13
+ 364               	.LVL30:
+ 365               	.L39:
+ 237:flashmemory.c **** //---- task execute ----
+ 366               		.loc 1 237 1 view .LVU66
+ 367               	.LBE43:
+ 368               	.LBE42:
+ 369               	.LBB44:
+ 370               	.LBB40:
+ 195:flashmemory.c **** 			if(t->compare(t->address, t->program_unit, t->data) == NG){
+ 371               		.loc 1 195 3 is_stmt 1 view .LVU67
+ 372 0148 4789      		ldd r20,Z+23
+ 373 014a 508D      		ldd r21,Z+24
+ 374 014c 6589      		ldd r22,Z+21
+ 375 014e 7689      		ldd r23,Z+22
+ 376 0150 2189      		ldd r18,Z+17
+ 377 0152 3289      		ldd r19,Z+18
+ 195:flashmemory.c **** 			if(t->compare(t->address, t->program_unit, t->data) == NG){
+ 378               		.loc 1 195 5 is_stmt 0 view .LVU68
+ 379 0154 8089      		ldd r24,Z+16
+ 380 0156 8823      		tst r24
+ 381 0158 01F0      		breq .L25
+ 195:flashmemory.c **** 			if(t->compare(t->address, t->program_unit, t->data) == NG){
+ 382               		.loc 1 195 29 view .LVU69
+ 383 015a F184      		ldd r15,Z+9
+ 384 015c F3E0      		ldi r31,lo8(3)
+ 385 015e FF12      		cpse r15,r31
+ 386 0160 00C0      		rjmp .L25
+ 195:flashmemory.c **** 			if(t->compare(t->address, t->program_unit, t->data) == NG){
+ 387               		.loc 1 195 56 view .LVU70
+ 388 0162 D801      		movw r26,r16
+ 389 0164 5A96      		adiw r26,26
+ 390 0166 8C91      		ld r24,X
+ 391 0168 5A97      		sbiw r26,26
+ 392 016a 8431      		cpi r24,lo8(20)
+ 393 016c 00F4      		brsh .L25
+ 196:flashmemory.c **** 				t->retry_count += 1;
+ 394               		.loc 1 196 4 is_stmt 1 view .LVU71
+ 196:flashmemory.c **** 				t->retry_count += 1;
+ 395               		.loc 1 196 7 is_stmt 0 view .LVU72
+ 396 016e 1696      		adiw r26,6
+ 397 0170 ED91      		ld r30,X+
+ 398 0172 FC91      		ld r31,X
+ 399 0174 C901      		movw r24,r18
+ 400 0176 0995      		icall
+ 401               	.LVL31:
+ 196:flashmemory.c **** 				t->retry_count += 1;
+ 402               		.loc 1 196 6 view .LVU73
+ 403 0178 8130      		cpi r24,lo8(1)
+ 404 017a 01F4      		brne .+2
+ 405 017c 00C0      		rjmp .L26
+ 406 017e F801      		movw r30,r16
+ 407 0180 2189      		ldd r18,Z+17
+ 408 0182 3289      		ldd r19,Z+18
+ 409 0184 6589      		ldd r22,Z+21
+ 410 0186 7689      		ldd r23,Z+22
+ 411 0188 4789      		ldd r20,Z+23
+ 412 018a 508D      		ldd r21,Z+24
+ 413 018c 9981      		ldd r25,Y+1
+ 414               	.L25:
+ 202:flashmemory.c **** 		t->address += t->program_unit;
+ 415               		.loc 1 202 3 is_stmt 1 view .LVU74
+ 202:flashmemory.c **** 		t->address += t->program_unit;
+ 416               		.loc 1 202 18 is_stmt 0 view .LVU75
+ 417 018e F801      		movw r30,r16
+ 418 0190 128E      		std Z+26,__zero_reg__
+ 203:flashmemory.c **** 		t->data += t->program_unit;
+ 419               		.loc 1 203 3 is_stmt 1 view .LVU76
+ 203:flashmemory.c **** 		t->data += t->program_unit;
+ 420               		.loc 1 203 14 is_stmt 0 view .LVU77
+ 421 0192 260F      		add r18,r22
+ 422 0194 371F      		adc r19,r23
+ 423 0196 328B      		std Z+18,r19
+ 424 0198 218B      		std Z+17,r18
+ 204:flashmemory.c **** 		t->length -= t->program_unit;
+ 425               		.loc 1 204 3 is_stmt 1 view .LVU78
+ 204:flashmemory.c **** 		t->length -= t->program_unit;
+ 426               		.loc 1 204 11 is_stmt 0 view .LVU79
+ 427 019a 460F      		add r20,r22
+ 428 019c 571F      		adc r21,r23
+ 429 019e 508F      		std Z+24,r21
+ 430 01a0 478B      		std Z+23,r20
+ 205:flashmemory.c **** 		if((t->length == 0) || (t->request == ERASE)){
+ 431               		.loc 1 205 3 is_stmt 1 view .LVU80
+ 205:flashmemory.c **** 		if((t->length == 0) || (t->request == ERASE)){
+ 432               		.loc 1 205 13 is_stmt 0 view .LVU81
+ 433 01a2 2389      		ldd r18,Z+19
+ 434 01a4 3489      		ldd r19,Z+20
+ 435 01a6 261B      		sub r18,r22
+ 436 01a8 370B      		sbc r19,r23
+ 437 01aa 348B      		std Z+20,r19
+ 438 01ac 238B      		std Z+19,r18
+ 206:flashmemory.c **** 			t->status = IDLE;
+ 439               		.loc 1 206 3 is_stmt 1 view .LVU82
+ 206:flashmemory.c **** 			t->status = IDLE;
+ 440               		.loc 1 206 5 is_stmt 0 view .LVU83
+ 441 01ae 232B      		or r18,r19
+ 442 01b0 01F4      		brne .+2
+ 443 01b2 00C0      		rjmp .L27
+ 206:flashmemory.c **** 			t->status = IDLE;
+ 444               		.loc 1 206 23 view .LVU84
+ 445 01b4 8185      		ldd r24,Z+9
+ 446 01b6 8130      		cpi r24,lo8(1)
+ 447 01b8 01F4      		brne .+2
+ 448 01ba 00C0      		rjmp .L27
+ 209:flashmemory.c **** 		}
+ 449               		.loc 1 209 4 is_stmt 1 view .LVU85
+ 209:flashmemory.c **** 		}
+ 450               		.loc 1 209 14 is_stmt 0 view .LVU86
+ 451 01bc 83E0      		ldi r24,lo8(3)
+ 452 01be 8087      		std Z+8,r24
+ 453 01c0 892F      		mov r24,r25
+ 454 01c2 8074      		andi r24,lo8(64)
+ 455 01c4 00C0      		rjmp .L24
+ 456               	.LVL32:
+ 457               	.L14:
+ 209:flashmemory.c **** 		}
+ 458               		.loc 1 209 14 view .LVU87
+ 459               	.LBE40:
+ 460               	.LBE44:
+ 252:flashmemory.c **** 			program(s);
+ 461               		.loc 1 252 3 is_stmt 1 view .LVU88
+ 252:flashmemory.c **** 			program(s);
+ 462               		.loc 1 252 5 is_stmt 0 view .LVU89
+ 463 01c6 5596      		adiw r26,21
+ 464 01c8 8D91      		ld r24,X+
+ 465 01ca 9C91      		ld r25,X
+ 466 01cc 5697      		sbiw r26,21+1
+ 467 01ce 0197      		sbiw r24,1
+ 468 01d0 01F4      		brne .+2
+ 469 01d2 00C0      		rjmp .L40
+ 470               	.L22:
+ 253:flashmemory.c **** 		}
+ 471               		.loc 1 253 4 is_stmt 1 view .LVU90
+ 472               	.LVL33:
+ 473               	.LBB45:
+ 474               	.LBI45:
+ 142:flashmemory.c **** {
+ 475               		.loc 1 142 13 view .LVU91
+ 476               	.LBB46:
+ 148:flashmemory.c **** 	t->writer(t->address, t->program_unit, t->data);
+ 477               		.loc 1 148 2 view .LVU92
+ 478 01d4 D801      		movw r26,r16
+ 479 01d6 1296      		adiw r26,2
+ 480 01d8 ED91      		ld r30,X+
+ 481 01da FC91      		ld r31,X
+ 482 01dc C801      		movw r24,r16
+ 483 01de 4B96      		adiw r24,27
+ 484 01e0 0995      		icall
+ 485               	.LVL34:
+ 149:flashmemory.c **** }
+ 486               		.loc 1 149 2 view .LVU93
+ 487 01e2 F801      		movw r30,r16
+ 488 01e4 4789      		ldd r20,Z+23
+ 489 01e6 508D      		ldd r21,Z+24
+ 490 01e8 6589      		ldd r22,Z+21
+ 491 01ea 7689      		ldd r23,Z+22
+ 492 01ec 0190      		ld __tmp_reg__,Z+
+ 493 01ee F081      		ld r31,Z
+ 494 01f0 E02D      		mov r30,__tmp_reg__
+ 495 01f2 D801      		movw r26,r16
+ 496 01f4 5196      		adiw r26,17
+ 497 01f6 8D91      		ld r24,X+
+ 498 01f8 9C91      		ld r25,X
+ 499 01fa 0995      		icall
+ 500               	.LVL35:
+ 501               	.L23:
+ 149:flashmemory.c **** }
+ 502               		.loc 1 149 2 is_stmt 0 view .LVU94
+ 503               	.LBE46:
+ 504               	.LBE45:
+ 255:flashmemory.c **** 		break;
+ 505               		.loc 1 255 3 is_stmt 1 view .LVU95
+ 255:flashmemory.c **** 		break;
+ 506               		.loc 1 255 13 is_stmt 0 view .LVU96
+ 507 01fc 84E0      		ldi r24,lo8(4)
+ 508 01fe F801      		movw r30,r16
+ 509 0200 8087      		std Z+8,r24
+ 256:flashmemory.c **** 	case TOGGLE_FIRST:
+ 510               		.loc 1 256 3 is_stmt 1 view .LVU97
+ 511               	/* epilogue start */
+ 512               		.loc 1 266 1 is_stmt 0 view .LVU98
+ 513 0202 0F90      		pop __tmp_reg__
+ 514 0204 DF91      		pop r29
+ 515 0206 CF91      		pop r28
+ 516 0208 1F91      		pop r17
+ 517 020a 0F91      		pop r16
+ 518               	.LVL36:
+ 519               		.loc 1 266 1 view .LVU99
+ 520 020c FF90      		pop r15
+ 521 020e 0895      		ret
+ 522               	.LVL37:
+ 523               	.L19:
+ 258:flashmemory.c **** 		s->status = TOGGLE_CHECK;
+ 524               		.loc 1 258 3 is_stmt 1 view .LVU100
+ 525               	.LBB47:
+ 526               	.LBI47:
+ 185:flashmemory.c **** {
+ 527               		.loc 1 185 13 view .LVU101
+ 528               	.LBB48:
+ 187:flashmemory.c **** 	t->toggle &= 0x40;
+ 529               		.loc 1 187 2 view .LVU102
+ 530 0210 A801      		movw r20,r16
+ 531 0212 475E      		subi r20,-25
+ 532 0214 5F4F      		sbci r21,-1
+ 533 0216 1496      		adiw r26,4
+ 534 0218 ED91      		ld r30,X+
+ 535 021a FC91      		ld r31,X
+ 536 021c 1597      		sbiw r26,4+1
+ 537 021e 61E0      		ldi r22,lo8(1)
+ 538 0220 70E0      		ldi r23,0
+ 539 0222 5196      		adiw r26,17
+ 540 0224 8D91      		ld r24,X+
+ 541 0226 9C91      		ld r25,X
+ 542 0228 0995      		icall
+ 543               	.LVL38:
+ 188:flashmemory.c **** }
+ 544               		.loc 1 188 2 view .LVU103
+ 188:flashmemory.c **** }
+ 545               		.loc 1 188 12 is_stmt 0 view .LVU104
+ 546 022a F801      		movw r30,r16
+ 547 022c 818D      		ldd r24,Z+25
+ 548 022e 8074      		andi r24,lo8(64)
+ 549 0230 818F      		std Z+25,r24
+ 550               	.LVL39:
+ 188:flashmemory.c **** }
+ 551               		.loc 1 188 12 view .LVU105
+ 552               	.LBE48:
+ 553               	.LBE47:
+ 259:flashmemory.c **** 		break;
+ 554               		.loc 1 259 3 is_stmt 1 view .LVU106
+ 259:flashmemory.c **** 		break;
+ 555               		.loc 1 259 13 is_stmt 0 view .LVU107
+ 556 0232 85E0      		ldi r24,lo8(5)
+ 557 0234 8087      		std Z+8,r24
+ 260:flashmemory.c **** 	case TOGGLE_CHECK:
+ 558               		.loc 1 260 3 is_stmt 1 view .LVU108
+ 559               	/* epilogue start */
+ 560               		.loc 1 266 1 is_stmt 0 view .LVU109
+ 561 0236 0F90      		pop __tmp_reg__
+ 562 0238 DF91      		pop r29
+ 563 023a CF91      		pop r28
+ 564 023c 1F91      		pop r17
+ 565 023e 0F91      		pop r16
+ 566               	.LVL40:
+ 567               		.loc 1 266 1 view .LVU110
+ 568 0240 FF90      		pop r15
+ 569 0242 0895      		ret
+ 570               	.LVL41:
+ 571               	.L16:
+ 245:flashmemory.c **** 		s->status = ERASE_WAIT;
+ 572               		.loc 1 245 3 is_stmt 1 view .LVU111
+ 573               	.LBB49:
+ 574               	.LBI49:
+ 152:flashmemory.c **** {
+ 575               		.loc 1 152 13 view .LVU112
+ 576               	.LBB50:
+ 154:flashmemory.c **** 		{C5555, 0xaa}, {C2AAA, 0x55}, {C5555, 0x80}, 
+ 577               		.loc 1 154 2 view .LVU113
+ 159:flashmemory.c **** }
+ 578               		.loc 1 159 2 view .LVU114
+ 579 0244 B801      		movw r22,r16
+ 580 0246 80E0      		ldi r24,lo8(c.1787)
+ 581 0248 90E0      		ldi r25,hi8(c.1787)
+ 582 024a 0E94 0000 		call command_execute
+ 583               	.LVL42:
+ 159:flashmemory.c **** }
+ 584               		.loc 1 159 2 is_stmt 0 view .LVU115
+ 585               	.LBE50:
+ 586               	.LBE49:
+ 246:flashmemory.c **** 		break;
+ 587               		.loc 1 246 3 is_stmt 1 view .LVU116
+ 246:flashmemory.c **** 		break;
+ 588               		.loc 1 246 13 is_stmt 0 view .LVU117
+ 589 024e 82E0      		ldi r24,lo8(2)
+ 590 0250 F801      		movw r30,r16
+ 591 0252 8087      		std Z+8,r24
+ 247:flashmemory.c **** 	case ERASE_WAIT:
+ 592               		.loc 1 247 3 is_stmt 1 view .LVU118
+ 593               	/* epilogue start */
+ 594               		.loc 1 266 1 is_stmt 0 view .LVU119
+ 595 0254 0F90      		pop __tmp_reg__
+ 596 0256 DF91      		pop r29
+ 597 0258 CF91      		pop r28
+ 598 025a 1F91      		pop r17
+ 599 025c 0F91      		pop r16
+ 600               	.LVL43:
+ 601               		.loc 1 266 1 view .LVU120
+ 602 025e FF90      		pop r15
+ 603 0260 0895      		ret
+ 604               	.LVL44:
+ 605               	.L40:
+ 252:flashmemory.c **** 			program(s);
+ 606               		.loc 1 252 33 discriminator 1 view .LVU121
+ 607 0262 5796      		adiw r26,23
+ 608 0264 ED91      		ld r30,X+
+ 609 0266 FC91      		ld r31,X
+ 252:flashmemory.c **** 			program(s);
+ 610               		.loc 1 252 29 discriminator 1 view .LVU122
+ 611 0268 8081      		ld r24,Z
+ 612 026a 8F3F      		cpi r24,lo8(-1)
+ 613 026c 01F0      		breq .+2
+ 614 026e 00C0      		rjmp .L22
+ 615 0270 00C0      		rjmp .L23
+ 616               	.LVL45:
+ 617               	.L27:
+ 618               	.LBB51:
+ 619               	.LBB41:
+ 207:flashmemory.c **** 		}else{
+ 620               		.loc 1 207 4 is_stmt 1 view .LVU123
+ 207:flashmemory.c **** 		}else{
+ 621               		.loc 1 207 14 is_stmt 0 view .LVU124
+ 622 0272 D801      		movw r26,r16
+ 623 0274 1896      		adiw r26,8
+ 624 0276 1C92      		st X,__zero_reg__
+ 625 0278 892F      		mov r24,r25
+ 626 027a 8074      		andi r24,lo8(64)
+ 627 027c 00C0      		rjmp .L24
+ 628               	.L26:
+ 197:flashmemory.c **** 				t->status = PROGRAM;
+ 629               		.loc 1 197 5 is_stmt 1 view .LVU125
+ 197:flashmemory.c **** 				t->status = PROGRAM;
+ 630               		.loc 1 197 20 is_stmt 0 view .LVU126
+ 631 027e D801      		movw r26,r16
+ 632 0280 5A96      		adiw r26,26
+ 633 0282 8C91      		ld r24,X
+ 634 0284 5A97      		sbiw r26,26
+ 635 0286 8F5F      		subi r24,lo8(-(1))
+ 636 0288 5A96      		adiw r26,26
+ 637 028a 8C93      		st X,r24
+ 638 028c 5A97      		sbiw r26,26
+ 198:flashmemory.c **** 				return;
+ 639               		.loc 1 198 5 is_stmt 1 view .LVU127
+ 198:flashmemory.c **** 				return;
+ 640               		.loc 1 198 15 is_stmt 0 view .LVU128
+ 641 028e 1896      		adiw r26,8
+ 642 0290 FC92      		st X,r15
+ 199:flashmemory.c **** 			}
+ 643               		.loc 1 199 5 is_stmt 1 view .LVU129
+ 644 0292 00C0      		rjmp .L13
+ 645               	.LBE41:
+ 646               	.LBE51:
+ 647               		.cfi_endproc
+ 648               	.LFE28:
+ 650               	.global	flash_cpu_status
+ 652               	flash_cpu_status:
+ 653               	.LFB7:
+  37:flashmemory.c **** 	return seqence_cpu.status;
+ 654               		.loc 1 37 1 view -0
+ 655               		.cfi_startproc
+ 656               	/* prologue: function */
+ 657               	/* frame size = 0 */
+ 658               	/* stack size = 0 */
+ 659               	.L__stack_usage = 0
+  38:flashmemory.c **** }
+ 660               		.loc 1 38 2 view .LVU131
+  39:flashmemory.c **** uint8_t flash_ppu_status(void)
+ 661               		.loc 1 39 1 is_stmt 0 view .LVU132
+ 662 0294 8091 0000 		lds r24,seqence_cpu+8
+ 663               	/* epilogue start */
+ 664 0298 0895      		ret
+ 665               		.cfi_endproc
+ 666               	.LFE7:
+ 668               	.global	flash_ppu_status
+ 670               	flash_ppu_status:
+ 671               	.LFB8:
+  41:flashmemory.c **** 	return seqence_ppu.status;
+ 672               		.loc 1 41 1 is_stmt 1 view -0
+ 673               		.cfi_startproc
+ 674               	/* prologue: function */
+ 675               	/* frame size = 0 */
+ 676               	/* stack size = 0 */
+ 677               	.L__stack_usage = 0
+  42:flashmemory.c **** }
+ 678               		.loc 1 42 2 view .LVU134
+  43:flashmemory.c **** void flash_both_idle(void)
+ 679               		.loc 1 43 1 is_stmt 0 view .LVU135
+ 680 029a 8091 0000 		lds r24,seqence_ppu+8
+ 681               	/* epilogue start */
+ 682 029e 0895      		ret
+ 683               		.cfi_endproc
+ 684               	.LFE8:
+ 686               	.global	flash_both_idle
+ 688               	flash_both_idle:
+ 689               	.LFB9:
+  45:flashmemory.c **** 	seqence_cpu.status = IDLE;
+ 690               		.loc 1 45 1 is_stmt 1 view -0
+ 691               		.cfi_startproc
+ 692               	/* prologue: function */
+ 693               	/* frame size = 0 */
+ 694               	/* stack size = 0 */
+ 695               	.L__stack_usage = 0
+  46:flashmemory.c **** 	seqence_ppu.status = IDLE;
+ 696               		.loc 1 46 2 view .LVU137
+  46:flashmemory.c **** 	seqence_ppu.status = IDLE;
+ 697               		.loc 1 46 21 is_stmt 0 view .LVU138
+ 698 02a0 1092 0000 		sts seqence_cpu+8,__zero_reg__
+  47:flashmemory.c **** }
+ 699               		.loc 1 47 2 is_stmt 1 view .LVU139
+  47:flashmemory.c **** }
+ 700               		.loc 1 47 21 is_stmt 0 view .LVU140
+ 701 02a4 1092 0000 		sts seqence_ppu+8,__zero_reg__
+ 702               	/* epilogue start */
+  48:flashmemory.c **** static inline uint16_t unpack_short_le(const uint8_t *t)
+ 703               		.loc 1 48 1 view .LVU141
+ 704 02a8 0895      		ret
+ 705               		.cfi_endproc
+ 706               	.LFE9:
+ 708               	.global	flash_cpu_config
+ 710               	flash_cpu_config:
+ 711               	.LVL46:
+ 712               	.LFB12:
+  79:flashmemory.c **** 	config_set(data, length, &seqence_cpu);
+ 713               		.loc 1 79 1 is_stmt 1 view -0
+ 714               		.cfi_startproc
+ 715               	/* prologue: function */
+ 716               	/* frame size = 0 */
+ 717               	/* stack size = 0 */
+ 718               	.L__stack_usage = 0
+  79:flashmemory.c **** 	config_set(data, length, &seqence_cpu);
+ 719               		.loc 1 79 1 is_stmt 0 view .LVU143
+ 720 02aa FC01      		movw r30,r24
+  80:flashmemory.c **** }
+ 721               		.loc 1 80 2 is_stmt 1 view .LVU144
+ 722               	.LVL47:
+ 723               	.LBB62:
+ 724               	.LBI62:
+  55:flashmemory.c **** {
+ 725               		.loc 1 55 13 view .LVU145
+ 726               	.LBB63:
+  57:flashmemory.c **** 	data += sizeof(uint16_t);
+ 727               		.loc 1 57 2 view .LVU146
+ 728               	.LBB64:
+ 729               	.LBI64:
+  49:flashmemory.c **** {
+ 730               		.loc 1 49 24 view .LVU147
+ 731               	.LBB65:
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 732               		.loc 1 51 2 view .LVU148
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 733               		.loc 1 51 11 is_stmt 0 view .LVU149
+ 734 02ac 8081      		ld r24,Z
+ 735               	.LVL48:
+  52:flashmemory.c **** 	return r;
+ 736               		.loc 1 52 2 is_stmt 1 view .LVU150
+  53:flashmemory.c **** }
+ 737               		.loc 1 53 2 view .LVU151
+  52:flashmemory.c **** 	return r;
+ 738               		.loc 1 52 8 is_stmt 0 view .LVU152
+ 739 02ae 9181      		ldd r25,Z+1
+ 740               	.LBE65:
+ 741               	.LBE64:
+  57:flashmemory.c **** 	data += sizeof(uint16_t);
+ 742               		.loc 1 57 18 view .LVU153
+ 743 02b0 9093 0000 		sts seqence_cpu+10+1,r25
+ 744 02b4 8093 0000 		sts seqence_cpu+10,r24
+  58:flashmemory.c **** 	t->command_2aaa = unpack_short_le(data);
+ 745               		.loc 1 58 2 is_stmt 1 view .LVU154
+ 746               	.LVL49:
+  59:flashmemory.c **** 	data += sizeof(uint16_t);
+ 747               		.loc 1 59 2 view .LVU155
+ 748               	.LBB66:
+ 749               	.LBI66:
+  49:flashmemory.c **** {
+ 750               		.loc 1 49 24 view .LVU156
+ 751               	.LBB67:
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 752               		.loc 1 51 2 view .LVU157
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 753               		.loc 1 51 11 is_stmt 0 view .LVU158
+ 754 02b8 2281      		ldd r18,Z+2
+ 755               	.LVL50:
+  52:flashmemory.c **** 	return r;
+ 756               		.loc 1 52 2 is_stmt 1 view .LVU159
+  52:flashmemory.c **** 	return r;
+ 757               		.loc 1 52 8 is_stmt 0 view .LVU160
+ 758 02ba 8381      		ldd r24,Z+3
+  52:flashmemory.c **** 	return r;
+ 759               		.loc 1 52 4 view .LVU161
+ 760 02bc 382F      		mov r19,r24
+ 761               	.LVL51:
+  53:flashmemory.c **** }
+ 762               		.loc 1 53 2 is_stmt 1 view .LVU162
+  53:flashmemory.c **** }
+ 763               		.loc 1 53 2 is_stmt 0 view .LVU163
+ 764               	.LBE67:
+ 765               	.LBE66:
+  59:flashmemory.c **** 	data += sizeof(uint16_t);
+ 766               		.loc 1 59 18 view .LVU164
+ 767 02be 3093 0000 		sts seqence_cpu+12+1,r19
+ 768 02c2 2093 0000 		sts seqence_cpu+12,r18
+  60:flashmemory.c **** 	t->command_5555 = unpack_short_le(data);
+ 769               		.loc 1 60 2 is_stmt 1 view .LVU165
+ 770               	.LVL52:
+  61:flashmemory.c **** 	data += sizeof(uint16_t);
+ 771               		.loc 1 61 2 view .LVU166
+ 772               	.LBB68:
+ 773               	.LBI68:
+  49:flashmemory.c **** {
+ 774               		.loc 1 49 24 view .LVU167
+ 775               	.LBB69:
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 776               		.loc 1 51 2 view .LVU168
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 777               		.loc 1 51 11 is_stmt 0 view .LVU169
+ 778 02c6 8481      		ldd r24,Z+4
+ 779               	.LVL53:
+  52:flashmemory.c **** 	return r;
+ 780               		.loc 1 52 2 is_stmt 1 view .LVU170
+  52:flashmemory.c **** 	return r;
+ 781               		.loc 1 52 8 is_stmt 0 view .LVU171
+ 782 02c8 9581      		ldd r25,Z+5
+ 783               	.LVL54:
+  53:flashmemory.c **** }
+ 784               		.loc 1 53 2 is_stmt 1 view .LVU172
+  53:flashmemory.c **** }
+ 785               		.loc 1 53 2 is_stmt 0 view .LVU173
+ 786               	.LBE69:
+ 787               	.LBE68:
+  61:flashmemory.c **** 	data += sizeof(uint16_t);
+ 788               		.loc 1 61 18 view .LVU174
+ 789 02ca 9093 0000 		sts seqence_cpu+14+1,r25
+ 790 02ce 8093 0000 		sts seqence_cpu+14,r24
+  62:flashmemory.c **** 	t->program_unit = unpack_short_le(data);
+ 791               		.loc 1 62 2 is_stmt 1 view .LVU175
+ 792               	.LVL55:
+  63:flashmemory.c **** 	data += sizeof(uint16_t);
+ 793               		.loc 1 63 2 view .LVU176
+ 794               	.LBB70:
+ 795               	.LBI70:
+  49:flashmemory.c **** {
+ 796               		.loc 1 49 24 view .LVU177
+ 797               	.LBB71:
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 798               		.loc 1 51 2 view .LVU178
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 799               		.loc 1 51 11 is_stmt 0 view .LVU179
+ 800 02d2 4681      		ldd r20,Z+6
+ 801               	.LVL56:
+  52:flashmemory.c **** 	return r;
+ 802               		.loc 1 52 2 is_stmt 1 view .LVU180
+  53:flashmemory.c **** }
+ 803               		.loc 1 53 2 view .LVU181
+  52:flashmemory.c **** 	return r;
+ 804               		.loc 1 52 8 is_stmt 0 view .LVU182
+ 805 02d4 5781      		ldd r21,Z+7
+ 806               	.LBE71:
+ 807               	.LBE70:
+  63:flashmemory.c **** 	data += sizeof(uint16_t);
+ 808               		.loc 1 63 18 view .LVU183
+ 809 02d6 5093 0000 		sts seqence_cpu+21+1,r21
+ 810 02da 4093 0000 		sts seqence_cpu+21,r20
+  64:flashmemory.c **** 	if(length < 9){ //support client 0.6.0
+ 811               		.loc 1 64 2 is_stmt 1 view .LVU184
+ 812               	.LVL57:
+  65:flashmemory.c **** 		t->retry_enable = 0;
+ 813               		.loc 1 65 2 view .LVU185
+  65:flashmemory.c **** 		t->retry_enable = 0;
+ 814               		.loc 1 65 4 is_stmt 0 view .LVU186
+ 815 02de 6930      		cpi r22,9
+ 816 02e0 7105      		cpc r23,__zero_reg__
+ 817 02e2 00F4      		brsh .L45
+  66:flashmemory.c **** 	}else{
+ 818               		.loc 1 66 3 is_stmt 1 view .LVU187
+  66:flashmemory.c **** 	}else{
+ 819               		.loc 1 66 19 is_stmt 0 view .LVU188
+ 820 02e4 1092 0000 		sts seqence_cpu+16,__zero_reg__
+ 821               	.L46:
+  71:flashmemory.c **** 	t->program_command[0].data = 0xaa;
+ 822               		.loc 1 71 2 is_stmt 1 view .LVU189
+  71:flashmemory.c **** 	t->program_command[0].data = 0xaa;
+ 823               		.loc 1 71 32 is_stmt 0 view .LVU190
+ 824 02e8 9093 0000 		sts seqence_cpu+27+1,r25
+ 825 02ec 8093 0000 		sts seqence_cpu+27,r24
+  72:flashmemory.c **** 	t->program_command[1].address = t->command_2aaa;
+ 826               		.loc 1 72 2 is_stmt 1 view .LVU191
+  72:flashmemory.c **** 	t->program_command[1].address = t->command_2aaa;
+ 827               		.loc 1 72 29 is_stmt 0 view .LVU192
+ 828 02f0 4AEA      		ldi r20,lo8(-86)
+ 829 02f2 4093 0000 		sts seqence_cpu+29,r20
+  73:flashmemory.c **** 	t->program_command[1].data = 0x55;
+ 830               		.loc 1 73 2 is_stmt 1 view .LVU193
+  73:flashmemory.c **** 	t->program_command[1].data = 0x55;
+ 831               		.loc 1 73 32 is_stmt 0 view .LVU194
+ 832 02f6 3093 0000 		sts seqence_cpu+30+1,r19
+ 833 02fa 2093 0000 		sts seqence_cpu+30,r18
+  74:flashmemory.c **** 	t->program_command[2].address = t->command_5555;
+ 834               		.loc 1 74 2 is_stmt 1 view .LVU195
+  74:flashmemory.c **** 	t->program_command[2].address = t->command_5555;
+ 835               		.loc 1 74 29 is_stmt 0 view .LVU196
+ 836 02fe 25E5      		ldi r18,lo8(85)
+ 837 0300 2093 0000 		sts seqence_cpu+32,r18
+  75:flashmemory.c **** 	t->program_command[2].data = 0xa0;
+ 838               		.loc 1 75 2 is_stmt 1 view .LVU197
+  75:flashmemory.c **** 	t->program_command[2].data = 0xa0;
+ 839               		.loc 1 75 32 is_stmt 0 view .LVU198
+ 840 0304 9093 0000 		sts seqence_cpu+33+1,r25
+ 841 0308 8093 0000 		sts seqence_cpu+33,r24
+  76:flashmemory.c **** };
+ 842               		.loc 1 76 2 is_stmt 1 view .LVU199
+  76:flashmemory.c **** };
+ 843               		.loc 1 76 29 is_stmt 0 view .LVU200
+ 844 030c 80EA      		ldi r24,lo8(-96)
+ 845 030e 8093 0000 		sts seqence_cpu+35,r24
+ 846               	.LVL58:
+ 847               	/* epilogue start */
+  76:flashmemory.c **** };
+ 848               		.loc 1 76 29 view .LVU201
+ 849               	.LBE63:
+ 850               	.LBE62:
+  81:flashmemory.c **** void flash_ppu_config(const uint8_t *data, uint16_t length)
+ 851               		.loc 1 81 1 view .LVU202
+ 852 0312 0895      		ret
+ 853               	.LVL59:
+ 854               	.L45:
+ 855               	.LBB73:
+ 856               	.LBB72:
+  68:flashmemory.c **** 	}
+ 857               		.loc 1 68 3 is_stmt 1 view .LVU203
+  68:flashmemory.c **** 	}
+ 858               		.loc 1 68 21 is_stmt 0 view .LVU204
+ 859 0314 4085      		ldd r20,Z+8
+  68:flashmemory.c **** 	}
+ 860               		.loc 1 68 19 view .LVU205
+ 861 0316 4093 0000 		sts seqence_cpu+16,r20
+ 862 031a 00C0      		rjmp .L46
+ 863               	.LBE72:
+ 864               	.LBE73:
+ 865               		.cfi_endproc
+ 866               	.LFE12:
+ 868               	.global	flash_ppu_config
+ 870               	flash_ppu_config:
+ 871               	.LVL60:
+ 872               	.LFB13:
+  83:flashmemory.c **** 	config_set(data, length, &seqence_ppu);
+ 873               		.loc 1 83 1 is_stmt 1 view -0
+ 874               		.cfi_startproc
+ 875               	/* prologue: function */
+ 876               	/* frame size = 0 */
+ 877               	/* stack size = 0 */
+ 878               	.L__stack_usage = 0
+  83:flashmemory.c **** 	config_set(data, length, &seqence_ppu);
+ 879               		.loc 1 83 1 is_stmt 0 view .LVU207
+ 880 031c FC01      		movw r30,r24
+  84:flashmemory.c **** }
+ 881               		.loc 1 84 2 is_stmt 1 view .LVU208
+ 882               	.LVL61:
+ 883               	.LBB84:
+ 884               	.LBI84:
+  55:flashmemory.c **** {
+ 885               		.loc 1 55 13 view .LVU209
+ 886               	.LBB85:
+  57:flashmemory.c **** 	data += sizeof(uint16_t);
+ 887               		.loc 1 57 2 view .LVU210
+ 888               	.LBB86:
+ 889               	.LBI86:
+  49:flashmemory.c **** {
+ 890               		.loc 1 49 24 view .LVU211
+ 891               	.LBB87:
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 892               		.loc 1 51 2 view .LVU212
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 893               		.loc 1 51 11 is_stmt 0 view .LVU213
+ 894 031e 8081      		ld r24,Z
+ 895               	.LVL62:
+  52:flashmemory.c **** 	return r;
+ 896               		.loc 1 52 2 is_stmt 1 view .LVU214
+  53:flashmemory.c **** }
+ 897               		.loc 1 53 2 view .LVU215
+  52:flashmemory.c **** 	return r;
+ 898               		.loc 1 52 8 is_stmt 0 view .LVU216
+ 899 0320 9181      		ldd r25,Z+1
+ 900               	.LBE87:
+ 901               	.LBE86:
+  57:flashmemory.c **** 	data += sizeof(uint16_t);
+ 902               		.loc 1 57 18 view .LVU217
+ 903 0322 9093 0000 		sts seqence_ppu+10+1,r25
+ 904 0326 8093 0000 		sts seqence_ppu+10,r24
+  58:flashmemory.c **** 	t->command_2aaa = unpack_short_le(data);
+ 905               		.loc 1 58 2 is_stmt 1 view .LVU218
+ 906               	.LVL63:
+  59:flashmemory.c **** 	data += sizeof(uint16_t);
+ 907               		.loc 1 59 2 view .LVU219
+ 908               	.LBB88:
+ 909               	.LBI88:
+  49:flashmemory.c **** {
+ 910               		.loc 1 49 24 view .LVU220
+ 911               	.LBB89:
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 912               		.loc 1 51 2 view .LVU221
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 913               		.loc 1 51 11 is_stmt 0 view .LVU222
+ 914 032a 2281      		ldd r18,Z+2
+ 915               	.LVL64:
+  52:flashmemory.c **** 	return r;
+ 916               		.loc 1 52 2 is_stmt 1 view .LVU223
+  52:flashmemory.c **** 	return r;
+ 917               		.loc 1 52 8 is_stmt 0 view .LVU224
+ 918 032c 8381      		ldd r24,Z+3
+  52:flashmemory.c **** 	return r;
+ 919               		.loc 1 52 4 view .LVU225
+ 920 032e 382F      		mov r19,r24
+ 921               	.LVL65:
+  53:flashmemory.c **** }
+ 922               		.loc 1 53 2 is_stmt 1 view .LVU226
+  53:flashmemory.c **** }
+ 923               		.loc 1 53 2 is_stmt 0 view .LVU227
+ 924               	.LBE89:
+ 925               	.LBE88:
+  59:flashmemory.c **** 	data += sizeof(uint16_t);
+ 926               		.loc 1 59 18 view .LVU228
+ 927 0330 3093 0000 		sts seqence_ppu+12+1,r19
+ 928 0334 2093 0000 		sts seqence_ppu+12,r18
+  60:flashmemory.c **** 	t->command_5555 = unpack_short_le(data);
+ 929               		.loc 1 60 2 is_stmt 1 view .LVU229
+ 930               	.LVL66:
+  61:flashmemory.c **** 	data += sizeof(uint16_t);
+ 931               		.loc 1 61 2 view .LVU230
+ 932               	.LBB90:
+ 933               	.LBI90:
+  49:flashmemory.c **** {
+ 934               		.loc 1 49 24 view .LVU231
+ 935               	.LBB91:
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 936               		.loc 1 51 2 view .LVU232
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 937               		.loc 1 51 11 is_stmt 0 view .LVU233
+ 938 0338 8481      		ldd r24,Z+4
+ 939               	.LVL67:
+  52:flashmemory.c **** 	return r;
+ 940               		.loc 1 52 2 is_stmt 1 view .LVU234
+  52:flashmemory.c **** 	return r;
+ 941               		.loc 1 52 8 is_stmt 0 view .LVU235
+ 942 033a 9581      		ldd r25,Z+5
+ 943               	.LVL68:
+  53:flashmemory.c **** }
+ 944               		.loc 1 53 2 is_stmt 1 view .LVU236
+  53:flashmemory.c **** }
+ 945               		.loc 1 53 2 is_stmt 0 view .LVU237
+ 946               	.LBE91:
+ 947               	.LBE90:
+  61:flashmemory.c **** 	data += sizeof(uint16_t);
+ 948               		.loc 1 61 18 view .LVU238
+ 949 033c 9093 0000 		sts seqence_ppu+14+1,r25
+ 950 0340 8093 0000 		sts seqence_ppu+14,r24
+  62:flashmemory.c **** 	t->program_unit = unpack_short_le(data);
+ 951               		.loc 1 62 2 is_stmt 1 view .LVU239
+ 952               	.LVL69:
+  63:flashmemory.c **** 	data += sizeof(uint16_t);
+ 953               		.loc 1 63 2 view .LVU240
+ 954               	.LBB92:
+ 955               	.LBI92:
+  49:flashmemory.c **** {
+ 956               		.loc 1 49 24 view .LVU241
+ 957               	.LBB93:
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 958               		.loc 1 51 2 view .LVU242
+  51:flashmemory.c **** 	r |= t[1] << 8;
+ 959               		.loc 1 51 11 is_stmt 0 view .LVU243
+ 960 0344 4681      		ldd r20,Z+6
+ 961               	.LVL70:
+  52:flashmemory.c **** 	return r;
+ 962               		.loc 1 52 2 is_stmt 1 view .LVU244
+  53:flashmemory.c **** }
+ 963               		.loc 1 53 2 view .LVU245
+  52:flashmemory.c **** 	return r;
+ 964               		.loc 1 52 8 is_stmt 0 view .LVU246
+ 965 0346 5781      		ldd r21,Z+7
+ 966               	.LBE93:
+ 967               	.LBE92:
+  63:flashmemory.c **** 	data += sizeof(uint16_t);
+ 968               		.loc 1 63 18 view .LVU247
+ 969 0348 5093 0000 		sts seqence_ppu+21+1,r21
+ 970 034c 4093 0000 		sts seqence_ppu+21,r20
+  64:flashmemory.c **** 	if(length < 9){ //support client 0.6.0
+ 971               		.loc 1 64 2 is_stmt 1 view .LVU248
+ 972               	.LVL71:
+  65:flashmemory.c **** 		t->retry_enable = 0;
+ 973               		.loc 1 65 2 view .LVU249
+  65:flashmemory.c **** 		t->retry_enable = 0;
+ 974               		.loc 1 65 4 is_stmt 0 view .LVU250
+ 975 0350 6930      		cpi r22,9
+ 976 0352 7105      		cpc r23,__zero_reg__
+ 977 0354 00F4      		brsh .L48
+  66:flashmemory.c **** 	}else{
+ 978               		.loc 1 66 3 is_stmt 1 view .LVU251
+  66:flashmemory.c **** 	}else{
+ 979               		.loc 1 66 19 is_stmt 0 view .LVU252
+ 980 0356 1092 0000 		sts seqence_ppu+16,__zero_reg__
+ 981               	.L49:
+  71:flashmemory.c **** 	t->program_command[0].data = 0xaa;
+ 982               		.loc 1 71 2 is_stmt 1 view .LVU253
+  71:flashmemory.c **** 	t->program_command[0].data = 0xaa;
+ 983               		.loc 1 71 32 is_stmt 0 view .LVU254
+ 984 035a 9093 0000 		sts seqence_ppu+27+1,r25
+ 985 035e 8093 0000 		sts seqence_ppu+27,r24
+  72:flashmemory.c **** 	t->program_command[1].address = t->command_2aaa;
+ 986               		.loc 1 72 2 is_stmt 1 view .LVU255
+  72:flashmemory.c **** 	t->program_command[1].address = t->command_2aaa;
+ 987               		.loc 1 72 29 is_stmt 0 view .LVU256
+ 988 0362 4AEA      		ldi r20,lo8(-86)
+ 989 0364 4093 0000 		sts seqence_ppu+29,r20
+  73:flashmemory.c **** 	t->program_command[1].data = 0x55;
+ 990               		.loc 1 73 2 is_stmt 1 view .LVU257
+  73:flashmemory.c **** 	t->program_command[1].data = 0x55;
+ 991               		.loc 1 73 32 is_stmt 0 view .LVU258
+ 992 0368 3093 0000 		sts seqence_ppu+30+1,r19
+ 993 036c 2093 0000 		sts seqence_ppu+30,r18
+  74:flashmemory.c **** 	t->program_command[2].address = t->command_5555;
+ 994               		.loc 1 74 2 is_stmt 1 view .LVU259
+  74:flashmemory.c **** 	t->program_command[2].address = t->command_5555;
+ 995               		.loc 1 74 29 is_stmt 0 view .LVU260
+ 996 0370 25E5      		ldi r18,lo8(85)
+ 997 0372 2093 0000 		sts seqence_ppu+32,r18
+  75:flashmemory.c **** 	t->program_command[2].data = 0xa0;
+ 998               		.loc 1 75 2 is_stmt 1 view .LVU261
+  75:flashmemory.c **** 	t->program_command[2].data = 0xa0;
+ 999               		.loc 1 75 32 is_stmt 0 view .LVU262
+ 1000 0376 9093 0000 		sts seqence_ppu+33+1,r25
+ 1001 037a 8093 0000 		sts seqence_ppu+33,r24
+  76:flashmemory.c **** };
+ 1002               		.loc 1 76 2 is_stmt 1 view .LVU263
+  76:flashmemory.c **** };
+ 1003               		.loc 1 76 29 is_stmt 0 view .LVU264
+ 1004 037e 80EA      		ldi r24,lo8(-96)
+ 1005 0380 8093 0000 		sts seqence_ppu+35,r24
+ 1006               	.LVL72:
+ 1007               	/* epilogue start */
+  76:flashmemory.c **** };
+ 1008               		.loc 1 76 29 view .LVU265
+ 1009               	.LBE85:
+ 1010               	.LBE84:
+  85:flashmemory.c **** 
+ 1011               		.loc 1 85 1 view .LVU266
+ 1012 0384 0895      		ret
+ 1013               	.LVL73:
+ 1014               	.L48:
+ 1015               	.LBB95:
+ 1016               	.LBB94:
+  68:flashmemory.c **** 	}
+ 1017               		.loc 1 68 3 is_stmt 1 view .LVU267
+  68:flashmemory.c **** 	}
+ 1018               		.loc 1 68 21 is_stmt 0 view .LVU268
+ 1019 0386 4085      		ldd r20,Z+8
+  68:flashmemory.c **** 	}
+ 1020               		.loc 1 68 19 view .LVU269
+ 1021 0388 4093 0000 		sts seqence_ppu+16,r20
+ 1022 038c 00C0      		rjmp .L49
+ 1023               	.LBE94:
+ 1024               	.LBE95:
+ 1025               		.cfi_endproc
+ 1026               	.LFE13:
+ 1028               	.global	flash_cpu_program
+ 1030               	flash_cpu_program:
+ 1031               	.LVL74:
+ 1032               	.LFB15:
+ 101:flashmemory.c **** 	program_assign(PROGRAM, address, length, data, &seqence_cpu);
+ 1033               		.loc 1 101 1 is_stmt 1 view -0
+ 1034               		.cfi_startproc
+ 1035               	/* prologue: function */
+ 1036               	/* frame size = 0 */
+ 1037               	/* stack size = 0 */
+ 1038               	.L__stack_usage = 0
+ 101:flashmemory.c **** 	program_assign(PROGRAM, address, length, data, &seqence_cpu);
+ 1039               		.loc 1 101 1 is_stmt 0 view .LVU271
+ 1040 038e 9C01      		movw r18,r24
+ 102:flashmemory.c **** }
+ 1041               		.loc 1 102 2 is_stmt 1 view .LVU272
+ 1042               	.LVL75:
+ 1043               	.LBB96:
+ 1044               	.LBI96:
+  87:flashmemory.c **** {
+ 1045               		.loc 1 87 13 view .LVU273
+ 1046               	.LBB97:
+  89:flashmemory.c **** 		t->status = TOGGLE_FIRST;
+ 1047               		.loc 1 89 2 view .LVU274
+  92:flashmemory.c **** 	}
+ 1048               		.loc 1 92 3 view .LVU275
+  92:flashmemory.c **** 	}
+ 1049               		.loc 1 92 13 is_stmt 0 view .LVU276
+ 1050 0390 E0E0      		ldi r30,lo8(seqence_cpu)
+ 1051 0392 F0E0      		ldi r31,hi8(seqence_cpu)
+ 1052 0394 93E0      		ldi r25,lo8(3)
+ 1053 0396 9087      		std Z+8,r25
+  94:flashmemory.c **** 	t->address = address;
+ 1054               		.loc 1 94 2 is_stmt 1 view .LVU277
+  94:flashmemory.c **** 	t->address = address;
+ 1055               		.loc 1 94 13 is_stmt 0 view .LVU278
+ 1056 0398 9187      		std Z+9,r25
+  95:flashmemory.c **** 	t->length = length;
+ 1057               		.loc 1 95 2 is_stmt 1 view .LVU279
+  95:flashmemory.c **** 	t->length = length;
+ 1058               		.loc 1 95 13 is_stmt 0 view .LVU280
+ 1059 039a 328B      		std Z+18,r19
+ 1060 039c 218B      		std Z+17,r18
+  96:flashmemory.c **** 	t->data = data;
+ 1061               		.loc 1 96 2 is_stmt 1 view .LVU281
+  96:flashmemory.c **** 	t->data = data;
+ 1062               		.loc 1 96 12 is_stmt 0 view .LVU282
+ 1063 039e 748B      		std Z+20,r23
+ 1064 03a0 638B      		std Z+19,r22
+  97:flashmemory.c **** 	t->retry_count = 0;
+ 1065               		.loc 1 97 2 is_stmt 1 view .LVU283
+  97:flashmemory.c **** 	t->retry_count = 0;
+ 1066               		.loc 1 97 10 is_stmt 0 view .LVU284
+ 1067 03a2 508F      		std Z+24,r21
+ 1068 03a4 478B      		std Z+23,r20
+  98:flashmemory.c **** }
+ 1069               		.loc 1 98 2 is_stmt 1 view .LVU285
+  98:flashmemory.c **** }
+ 1070               		.loc 1 98 17 is_stmt 0 view .LVU286
+ 1071 03a6 128E      		std Z+26,__zero_reg__
+ 1072               	.LVL76:
+ 1073               	/* epilogue start */
+  98:flashmemory.c **** }
+ 1074               		.loc 1 98 17 view .LVU287
+ 1075               	.LBE97:
+ 1076               	.LBE96:
+ 103:flashmemory.c **** void flash_ppu_program(uint16_t address, uint16_t length, const uint8_t *data)
+ 1077               		.loc 1 103 1 view .LVU288
+ 1078 03a8 0895      		ret
+ 1079               		.cfi_endproc
+ 1080               	.LFE15:
+ 1082               	.global	flash_ppu_program
+ 1084               	flash_ppu_program:
+ 1085               	.LVL77:
+ 1086               	.LFB16:
+ 105:flashmemory.c **** 	program_assign(PROGRAM, address, length, data, &seqence_ppu);
+ 1087               		.loc 1 105 1 is_stmt 1 view -0
+ 1088               		.cfi_startproc
+ 1089               	/* prologue: function */
+ 1090               	/* frame size = 0 */
+ 1091               	/* stack size = 0 */
+ 1092               	.L__stack_usage = 0
+ 105:flashmemory.c **** 	program_assign(PROGRAM, address, length, data, &seqence_ppu);
+ 1093               		.loc 1 105 1 is_stmt 0 view .LVU290
+ 1094 03aa 9C01      		movw r18,r24
+ 106:flashmemory.c **** }
+ 1095               		.loc 1 106 2 is_stmt 1 view .LVU291
+ 1096               	.LVL78:
+ 1097               	.LBB98:
+ 1098               	.LBI98:
+  87:flashmemory.c **** {
+ 1099               		.loc 1 87 13 view .LVU292
+ 1100               	.LBB99:
+  89:flashmemory.c **** 		t->status = TOGGLE_FIRST;
+ 1101               		.loc 1 89 2 view .LVU293
+  92:flashmemory.c **** 	}
+ 1102               		.loc 1 92 3 view .LVU294
+  92:flashmemory.c **** 	}
+ 1103               		.loc 1 92 13 is_stmt 0 view .LVU295
+ 1104 03ac E0E0      		ldi r30,lo8(seqence_ppu)
+ 1105 03ae F0E0      		ldi r31,hi8(seqence_ppu)
+ 1106 03b0 93E0      		ldi r25,lo8(3)
+ 1107 03b2 9087      		std Z+8,r25
+  94:flashmemory.c **** 	t->address = address;
+ 1108               		.loc 1 94 2 is_stmt 1 view .LVU296
+  94:flashmemory.c **** 	t->address = address;
+ 1109               		.loc 1 94 13 is_stmt 0 view .LVU297
+ 1110 03b4 9187      		std Z+9,r25
+  95:flashmemory.c **** 	t->length = length;
+ 1111               		.loc 1 95 2 is_stmt 1 view .LVU298
+  95:flashmemory.c **** 	t->length = length;
+ 1112               		.loc 1 95 13 is_stmt 0 view .LVU299
+ 1113 03b6 328B      		std Z+18,r19
+ 1114 03b8 218B      		std Z+17,r18
+  96:flashmemory.c **** 	t->data = data;
+ 1115               		.loc 1 96 2 is_stmt 1 view .LVU300
+  96:flashmemory.c **** 	t->data = data;
+ 1116               		.loc 1 96 12 is_stmt 0 view .LVU301
+ 1117 03ba 748B      		std Z+20,r23
+ 1118 03bc 638B      		std Z+19,r22
+  97:flashmemory.c **** 	t->retry_count = 0;
+ 1119               		.loc 1 97 2 is_stmt 1 view .LVU302
+  97:flashmemory.c **** 	t->retry_count = 0;
+ 1120               		.loc 1 97 10 is_stmt 0 view .LVU303
+ 1121 03be 508F      		std Z+24,r21
+ 1122 03c0 478B      		std Z+23,r20
+  98:flashmemory.c **** }
+ 1123               		.loc 1 98 2 is_stmt 1 view .LVU304
+  98:flashmemory.c **** }
+ 1124               		.loc 1 98 17 is_stmt 0 view .LVU305
+ 1125 03c2 128E      		std Z+26,__zero_reg__
+ 1126               	.LVL79:
+ 1127               	/* epilogue start */
+  98:flashmemory.c **** }
+ 1128               		.loc 1 98 17 view .LVU306
+ 1129               	.LBE99:
+ 1130               	.LBE98:
+ 107:flashmemory.c **** #define NULL (0)
+ 1131               		.loc 1 107 1 view .LVU307
+ 1132 03c4 0895      		ret
+ 1133               		.cfi_endproc
+ 1134               	.LFE16:
+ 1136               	.global	flash_cpu_erase
+ 1138               	flash_cpu_erase:
+ 1139               	.LVL80:
+ 1140               	.LFB17:
+ 110:flashmemory.c **** 	//length ¤Ë unit ¤òÅÏ¤·¤Æ toggle check ¸å IDLE ¤Ë¤Ê¤ë¤è¤¦¤Ë¤¹¤ë
+ 1141               		.loc 1 110 1 is_stmt 1 view -0
+ 1142               		.cfi_startproc
+ 1143               	/* prologue: function */
+ 1144               	/* frame size = 0 */
+ 1145               	/* stack size = 0 */
+ 1146               	.L__stack_usage = 0
+ 110:flashmemory.c **** 	//length ¤Ë unit ¤òÅÏ¤·¤Æ toggle check ¸å IDLE ¤Ë¤Ê¤ë¤è¤¦¤Ë¤¹¤ë
+ 1147               		.loc 1 110 1 is_stmt 0 view .LVU309
+ 1148 03c6 AC01      		movw r20,r24
+ 112:flashmemory.c **** }
+ 1149               		.loc 1 112 2 is_stmt 1 view .LVU310
+ 1150 03c8 E0E0      		ldi r30,lo8(seqence_cpu)
+ 1151 03ca F0E0      		ldi r31,hi8(seqence_cpu)
+ 1152 03cc 2589      		ldd r18,Z+21
+ 1153 03ce 3689      		ldd r19,Z+22
+ 1154               	.LVL81:
+ 1155               	.LBB100:
+ 1156               	.LBI100:
+  87:flashmemory.c **** {
+ 1157               		.loc 1 87 13 view .LVU311
+ 1158               	.LBB101:
+  89:flashmemory.c **** 		t->status = TOGGLE_FIRST;
+ 1159               		.loc 1 89 2 view .LVU312
+  92:flashmemory.c **** 	}
+ 1160               		.loc 1 92 3 view .LVU313
+  92:flashmemory.c **** 	}
+ 1161               		.loc 1 92 13 is_stmt 0 view .LVU314
+ 1162 03d0 91E0      		ldi r25,lo8(1)
+ 1163 03d2 9087      		std Z+8,r25
+  94:flashmemory.c **** 	t->address = address;
+ 1164               		.loc 1 94 2 is_stmt 1 view .LVU315
+  94:flashmemory.c **** 	t->address = address;
+ 1165               		.loc 1 94 13 is_stmt 0 view .LVU316
+ 1166 03d4 9187      		std Z+9,r25
+  95:flashmemory.c **** 	t->length = length;
+ 1167               		.loc 1 95 2 is_stmt 1 view .LVU317
+  95:flashmemory.c **** 	t->length = length;
+ 1168               		.loc 1 95 13 is_stmt 0 view .LVU318
+ 1169 03d6 528B      		std Z+18,r21
+ 1170 03d8 418B      		std Z+17,r20
+  96:flashmemory.c **** 	t->data = data;
+ 1171               		.loc 1 96 2 is_stmt 1 view .LVU319
+  96:flashmemory.c **** 	t->data = data;
+ 1172               		.loc 1 96 12 is_stmt 0 view .LVU320
+ 1173 03da 348B      		std Z+20,r19
+ 1174 03dc 238B      		std Z+19,r18
+  97:flashmemory.c **** 	t->retry_count = 0;
+ 1175               		.loc 1 97 2 is_stmt 1 view .LVU321
+  97:flashmemory.c **** 	t->retry_count = 0;
+ 1176               		.loc 1 97 10 is_stmt 0 view .LVU322
+ 1177 03de 108E      		std Z+24,__zero_reg__
+ 1178 03e0 178A      		std Z+23,__zero_reg__
+  98:flashmemory.c **** }
+ 1179               		.loc 1 98 2 is_stmt 1 view .LVU323
+  98:flashmemory.c **** }
+ 1180               		.loc 1 98 17 is_stmt 0 view .LVU324
+ 1181 03e2 128E      		std Z+26,__zero_reg__
+ 1182               	.LVL82:
+ 1183               	/* epilogue start */
+  98:flashmemory.c **** }
+ 1184               		.loc 1 98 17 view .LVU325
+ 1185               	.LBE101:
+ 1186               	.LBE100:
+ 113:flashmemory.c **** void flash_ppu_erase(uint16_t address)
+ 1187               		.loc 1 113 1 view .LVU326
+ 1188 03e4 0895      		ret
+ 1189               		.cfi_endproc
+ 1190               	.LFE17:
+ 1192               	.global	flash_ppu_erase
+ 1194               	flash_ppu_erase:
+ 1195               	.LVL83:
+ 1196               	.LFB18:
+ 115:flashmemory.c **** 	program_assign(ERASE, address, seqence_ppu.program_unit, NULL, &seqence_ppu);
+ 1197               		.loc 1 115 1 is_stmt 1 view -0
+ 1198               		.cfi_startproc
+ 1199               	/* prologue: function */
+ 1200               	/* frame size = 0 */
+ 1201               	/* stack size = 0 */
+ 1202               	.L__stack_usage = 0
+ 115:flashmemory.c **** 	program_assign(ERASE, address, seqence_ppu.program_unit, NULL, &seqence_ppu);
+ 1203               		.loc 1 115 1 is_stmt 0 view .LVU328
+ 1204 03e6 AC01      		movw r20,r24
+ 116:flashmemory.c **** }
+ 1205               		.loc 1 116 2 is_stmt 1 view .LVU329
+ 1206 03e8 E0E0      		ldi r30,lo8(seqence_ppu)
+ 1207 03ea F0E0      		ldi r31,hi8(seqence_ppu)
+ 1208 03ec 2589      		ldd r18,Z+21
+ 1209 03ee 3689      		ldd r19,Z+22
+ 1210               	.LVL84:
+ 1211               	.LBB102:
+ 1212               	.LBI102:
+  87:flashmemory.c **** {
+ 1213               		.loc 1 87 13 view .LVU330
+ 1214               	.LBB103:
+  89:flashmemory.c **** 		t->status = TOGGLE_FIRST;
+ 1215               		.loc 1 89 2 view .LVU331
+  92:flashmemory.c **** 	}
+ 1216               		.loc 1 92 3 view .LVU332
+  92:flashmemory.c **** 	}
+ 1217               		.loc 1 92 13 is_stmt 0 view .LVU333
+ 1218 03f0 91E0      		ldi r25,lo8(1)
+ 1219 03f2 9087      		std Z+8,r25
+  94:flashmemory.c **** 	t->address = address;
+ 1220               		.loc 1 94 2 is_stmt 1 view .LVU334
+  94:flashmemory.c **** 	t->address = address;
+ 1221               		.loc 1 94 13 is_stmt 0 view .LVU335
+ 1222 03f4 9187      		std Z+9,r25
+  95:flashmemory.c **** 	t->length = length;
+ 1223               		.loc 1 95 2 is_stmt 1 view .LVU336
+  95:flashmemory.c **** 	t->length = length;
+ 1224               		.loc 1 95 13 is_stmt 0 view .LVU337
+ 1225 03f6 528B      		std Z+18,r21
+ 1226 03f8 418B      		std Z+17,r20
+  96:flashmemory.c **** 	t->data = data;
+ 1227               		.loc 1 96 2 is_stmt 1 view .LVU338
+  96:flashmemory.c **** 	t->data = data;
+ 1228               		.loc 1 96 12 is_stmt 0 view .LVU339
+ 1229 03fa 348B      		std Z+20,r19
+ 1230 03fc 238B      		std Z+19,r18
+  97:flashmemory.c **** 	t->retry_count = 0;
+ 1231               		.loc 1 97 2 is_stmt 1 view .LVU340
+  97:flashmemory.c **** 	t->retry_count = 0;
+ 1232               		.loc 1 97 10 is_stmt 0 view .LVU341
+ 1233 03fe 108E      		std Z+24,__zero_reg__
+ 1234 0400 178A      		std Z+23,__zero_reg__
+  98:flashmemory.c **** }
+ 1235               		.loc 1 98 2 is_stmt 1 view .LVU342
+  98:flashmemory.c **** }
+ 1236               		.loc 1 98 17 is_stmt 0 view .LVU343
+ 1237 0402 128E      		std Z+26,__zero_reg__
+ 1238               	.LVL85:
+ 1239               	/* epilogue start */
+  98:flashmemory.c **** }
+ 1240               		.loc 1 98 17 view .LVU344
+ 1241               	.LBE103:
+ 1242               	.LBE102:
+ 117:flashmemory.c **** 
+ 1243               		.loc 1 117 1 view .LVU345
+ 1244 0404 0895      		ret
+ 1245               		.cfi_endproc
+ 1246               	.LFE18:
+ 1248               	.global	flash_cpu_device_get
+ 1250               	flash_cpu_device_get:
+ 1251               	.LVL86:
+ 1252               	.LFB23:
+ 177:flashmemory.c **** 	device_get(&seqence_cpu, d);
+ 1253               		.loc 1 177 1 is_stmt 1 view -0
+ 1254               		.cfi_startproc
+ 1255               	/* prologue: function */
+ 1256               	/* frame size = 0 */
+ 1257               	/* stack size = 0 */
+ 1258               	.L__stack_usage = 0
+ 177:flashmemory.c **** 	device_get(&seqence_cpu, d);
+ 1259               		.loc 1 177 1 is_stmt 0 view .LVU347
+ 1260 0406 BC01      		movw r22,r24
+ 178:flashmemory.c **** }
+ 1261               		.loc 1 178 2 is_stmt 1 view .LVU348
+ 1262 0408 80E0      		ldi r24,lo8(seqence_cpu)
+ 1263 040a 90E0      		ldi r25,hi8(seqence_cpu)
+ 1264               	.LVL87:
+ 178:flashmemory.c **** }
+ 1265               		.loc 1 178 2 is_stmt 0 view .LVU349
+ 1266 040c 0C94 0000 		jmp device_get
+ 1267               	.LVL88:
+ 178:flashmemory.c **** }
+ 1268               		.loc 1 178 2 view .LVU350
+ 1269               		.cfi_endproc
+ 1270               	.LFE23:
+ 1272               	.global	flash_ppu_device_get
+ 1274               	flash_ppu_device_get:
+ 1275               	.LVL89:
+ 1276               	.LFB24:
+ 181:flashmemory.c **** 	device_get(&seqence_ppu, d);
+ 1277               		.loc 1 181 1 is_stmt 1 view -0
+ 1278               		.cfi_startproc
+ 1279               	/* prologue: function */
+ 1280               	/* frame size = 0 */
+ 1281               	/* stack size = 0 */
+ 1282               	.L__stack_usage = 0
+ 181:flashmemory.c **** 	device_get(&seqence_ppu, d);
+ 1283               		.loc 1 181 1 is_stmt 0 view .LVU352
+ 1284 0410 BC01      		movw r22,r24
+ 182:flashmemory.c **** }
+ 1285               		.loc 1 182 2 is_stmt 1 view .LVU353
+ 1286 0412 80E0      		ldi r24,lo8(seqence_ppu)
+ 1287 0414 90E0      		ldi r25,hi8(seqence_ppu)
+ 1288               	.LVL90:
+ 182:flashmemory.c **** }
+ 1289               		.loc 1 182 2 is_stmt 0 view .LVU354
+ 1290 0416 0C94 0000 		jmp device_get
+ 1291               	.LVL91:
+ 182:flashmemory.c **** }
+ 1292               		.loc 1 182 2 view .LVU355
+ 1293               		.cfi_endproc
+ 1294               	.LFE24:
+ 1296               	.global	flash_process
+ 1298               	flash_process:
+ 1299               	.LFB29:
+ 267:flashmemory.c **** void flash_process(void)
+ 268:flashmemory.c **** {
+ 1300               		.loc 1 268 1 is_stmt 1 view -0
+ 1301               		.cfi_startproc
+ 1302               	/* prologue: function */
+ 1303               	/* frame size = 0 */
+ 1304               	/* stack size = 0 */
+ 1305               	.L__stack_usage = 0
+ 269:flashmemory.c **** 	//for CPU and PPU dual programming
+ 270:flashmemory.c **** 	process(&seqence_cpu);
+ 1306               		.loc 1 270 2 view .LVU357
+ 1307 041a 80E0      		ldi r24,lo8(seqence_cpu)
+ 1308 041c 90E0      		ldi r25,hi8(seqence_cpu)
+ 1309 041e 0E94 0000 		call process
+ 1310               	.LVL92:
+ 271:flashmemory.c **** 	process(&seqence_ppu);
+ 1311               		.loc 1 271 2 view .LVU358
+ 1312 0422 80E0      		ldi r24,lo8(seqence_ppu)
+ 1313 0424 90E0      		ldi r25,hi8(seqence_ppu)
+ 1314 0426 0C94 0000 		jmp process
+ 1315               	.LVL93:
+ 1316               		.cfi_endproc
+ 1317               	.LFE29:
+ 1319               		.section	.rodata
+ 1322               	c.1787:
+ 1323 0000 01        		.byte	1
+ 1324 0001 AA        		.byte	-86
+ 1325 0002 00        		.byte	0
+ 1326 0003 55        		.byte	85
+ 1327 0004 01        		.byte	1
+ 1328 0005 80        		.byte	-128
+ 1329 0006 01        		.byte	1
+ 1330 0007 AA        		.byte	-86
+ 1331 0008 00        		.byte	0
+ 1332 0009 55        		.byte	85
+ 1333 000a 01        		.byte	1
+ 1334 000b 10        		.byte	16
+ 1335 000c 02        		.byte	2
+ 1336 000d 00        		.byte	0
+ 1339               	exit.1793:
+ 1340 000e 01        		.byte	1
+ 1341 000f AA        		.byte	-86
+ 1342 0010 00        		.byte	0
+ 1343 0011 55        		.byte	85
+ 1344 0012 01        		.byte	1
+ 1345 0013 F0        		.byte	-16
+ 1346 0014 02        		.byte	2
+ 1347 0015 00        		.byte	0
+ 1350               	entry.1792:
+ 1351 0016 01        		.byte	1
+ 1352 0017 AA        		.byte	-86
+ 1353 0018 00        		.byte	0
+ 1354 0019 55        		.byte	85
+ 1355 001a 01        		.byte	1
+ 1356 001b 90        		.byte	-112
+ 1357 001c 02        		.byte	2
+ 1358 001d 00        		.byte	0
+ 1359               		.data
+ 1362               	seqence_ppu:
+ 1363 0000 0000      		.word	gs(ppu_write)
+ 1364 0002 0000      		.word	gs(ppu_write_order)
+ 1365 0004 0000      		.word	gs(ppu_read)
+ 1366 0006 0000      		.word	gs(ppu_compare)
+ 1367 0008 00        		.byte	0
+ 1368 0009 0000 0000 		.zero	27
+ 1368      0000 0000 
+ 1368      0000 0000 
+ 1368      0000 0000 
+ 1368      0000 0000 
+ 1371               	seqence_cpu:
+ 1372 0024 0000      		.word	gs(cpu_write_flash)
+ 1373 0026 0000      		.word	gs(cpu_write_flash_order)
+ 1374 0028 0000      		.word	gs(cpu_read)
+ 1375 002a 0000      		.word	gs(cpu_compare)
+ 1376 002c 00        		.byte	0
+ 1377 002d 0000 0000 		.zero	27
+ 1377      0000 0000 
+ 1377      0000 0000 
+ 1377      0000 0000 
+ 1377      0000 0000 
+ 1378               		.text
+ 1379               	.Letext0:
+ 1380               		.file 2 "/usr/avr/include/stdint.h"
+ 1381               		.file 3 "kazzo_task.h"
+ 1382               		.file 4 "bus_access.h"
+DEFINED SYMBOLS
+                            *ABS*:0000000000000000 flashmemory.c
+     /tmp/cc4Ev2nY.s:2      *ABS*:000000000000003e __SP_H__
+     /tmp/cc4Ev2nY.s:3      *ABS*:000000000000003d __SP_L__
+     /tmp/cc4Ev2nY.s:4      *ABS*:000000000000003f __SREG__
+     /tmp/cc4Ev2nY.s:5      *ABS*:0000000000000000 __tmp_reg__
+     /tmp/cc4Ev2nY.s:6      *ABS*:0000000000000001 __zero_reg__
+     /tmp/cc4Ev2nY.s:11     .text:0000000000000000 command_execute
+     /tmp/cc4Ev2nY.s:124    .text:0000000000000058 device_get
+     /tmp/cc4Ev2nY.s:1350   .rodata:0000000000000016 entry.1792
+     /tmp/cc4Ev2nY.s:1339   .rodata:000000000000000e exit.1793
+     /tmp/cc4Ev2nY.s:214    .text:00000000000000b0 process
+     /tmp/cc4Ev2nY.s:1322   .rodata:0000000000000000 c.1787
+     /tmp/cc4Ev2nY.s:652    .text:0000000000000294 flash_cpu_status
+     /tmp/cc4Ev2nY.s:1371   .data:0000000000000024 seqence_cpu
+     /tmp/cc4Ev2nY.s:670    .text:000000000000029a flash_ppu_status
+     /tmp/cc4Ev2nY.s:1362   .data:0000000000000000 seqence_ppu
+     /tmp/cc4Ev2nY.s:688    .text:00000000000002a0 flash_both_idle
+     /tmp/cc4Ev2nY.s:710    .text:00000000000002aa flash_cpu_config
+     /tmp/cc4Ev2nY.s:870    .text:000000000000031c flash_ppu_config
+     /tmp/cc4Ev2nY.s:1030   .text:000000000000038e flash_cpu_program
+     /tmp/cc4Ev2nY.s:1084   .text:00000000000003aa flash_ppu_program
+     /tmp/cc4Ev2nY.s:1138   .text:00000000000003c6 flash_cpu_erase
+     /tmp/cc4Ev2nY.s:1194   .text:00000000000003e6 flash_ppu_erase
+     /tmp/cc4Ev2nY.s:1250   .text:0000000000000406 flash_cpu_device_get
+     /tmp/cc4Ev2nY.s:1274   .text:0000000000000410 flash_ppu_device_get
+     /tmp/cc4Ev2nY.s:1298   .text:000000000000041a flash_process
+
+UNDEFINED SYMBOLS
+ppu_write
+ppu_write_order
+ppu_read
+ppu_compare
+cpu_write_flash
+cpu_write_flash_order
+cpu_read
+cpu_compare
+__do_copy_data

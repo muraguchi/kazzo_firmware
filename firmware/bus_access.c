@@ -1,3 +1,5 @@
+
+
 #include <util/delay.h>
 #include <avr/io.h>
 #include "type.h"
@@ -16,11 +18,11 @@ connected CPU and PPU databus*/
 #define ADDRESSBUS_A0_A7_DIR IO_DIRECTION(A)
 #define ADDRESSBUS_A0_A7_OUT IO_OUT(A)
 /* PBx: output/input
-connected address high latch(HC574), CPU and PPU databus*/
+connected address high latch(HC573), CPU and PPU databus*/
 #define DATABUS_DIR IO_DIRECTION(B)
 #define DATABUS_OUT IO_OUT(B)
 #define DATABUS_IN IO_IN(B)
-/*PCx: output ADDRESS_HIGH_LATCH connect HC574 clock pin, bus control signal
+/*PCx: output ADDRESS_HIGH_LATCH connect HC574 clock pin or HC573 latch enable bar pin, bus control signal
 VRAM_CS is input port this is design mistake!
 */
 #define BUS_CONTROL_DIR IO_DIRECTION(C)
@@ -86,10 +88,18 @@ enum databus_dir{
 	DATABUS_DIR_IN = 0
 };
 //when cpu_write_flash, phi2 must be low. when phi2 is high, mmc3 and vrc4 changes bank.
+#if PCB_REVISION == 1
 enum {
-	BUS_CLOSE = ~(1 << CPU_PHI2),
-	ADDRESS_CLOSE = 0x3fff //CPU and PPU are mapped internal registers, cartridge closes buses
+       BUS_CLOSE = (uint8_t)~((1<<ADDRESS_HIGH_LATCH)|(1 << CPU_PHI2)),
+       ADDRESS_CLOSE = 0x3fff //CPU and PPU are mapped internal registers, cartridge closes buses
 };
+#endif
+#if PCB_REVISION == 2
+enum {
+       BUS_CLOSE = (uint8_t)~(1 << CPU_PHI2),
+       ADDRESS_CLOSE = 0x3fff //CPU and PPU are mapped internal registers, cartridge closes buses
+};
+#endif
 
 static inline uint8_t bit_get_negative(enum iobit_bus_control bit)
 {
@@ -113,7 +123,7 @@ static void address_set(uint16_t address)
 	}
 	DATABUS_OUT = high;
 	//phi2 pulse is needed mmc1
-	BUS_CONTROL_OUT = bit_get_negative(ADDRESS_HIGH_LATCH);
+	BUS_CONTROL_OUT = ~(0); 
 	BUS_CONTROL_OUT = BUS_CLOSE;
 }
 
@@ -133,15 +143,15 @@ static void address_set(uint16_t address)
 {
 	const uint8_t portb = 0x05;
 	DATABUS_OUT = address & 0xff;
-	asm("cbi %0,%1" : :"M"(portb),"M"(ADDRESS_LOW_LATCH));
 	asm("sbi %0,%1" : :"M"(portb),"M"(ADDRESS_LOW_LATCH));
+	asm("cbi %0,%1" : :"M"(portb),"M"(ADDRESS_LOW_LATCH));
 	uint8_t high = (address & 0x7fff) >> 8; //mask A0-A14
 	if((address & (1 << 13)) == 0){ //if A13 == 0
 		high |= 0x80; //set /A13
 	}
 	DATABUS_OUT = high;
-	asm("cbi %0,%1" : :"M"(portb),"M"(ADDRESS_HIGH_LATCH));
 	asm("sbi %0,%1" : :"M"(portb),"M"(ADDRESS_HIGH_LATCH));
+	asm("cbi %0,%1" : :"M"(portb),"M"(ADDRESS_HIGH_LATCH));
 	//phi2 pulse is needed mmc1
 	BUS_CONTROL_OUT = BUS_CLOSE | (1 << CPU_PHI2);
 	BUS_CONTROL_OUT = BUS_CLOSE;
@@ -263,7 +273,12 @@ void ppu_read(uint16_t address, uint16_t length, uint8_t *data)
 	while(length != 0){
 		direction_write();
 		address_set(address);
+#if PCB_REVISION == 1
+		BUS_CONTROL_OUT = bit_get_negative(ADDRESS_HIGH_LATCH) & bit_get_negative(PPU_RD) & bit_get_negative(CPU_PHI2);
+#endif
+#if PCB_REVISION == 2
 		BUS_CONTROL_OUT = bit_get_negative(PPU_RD) & bit_get_negative(CPU_PHI2);
+#endif
 		direction_read();
 		*data = DATABUS_IN;
 		data += 1;
@@ -280,7 +295,12 @@ enum compare_status cpu_compare(uint16_t address, uint16_t length, const uint8_t
 		BUS_CONTROL_OUT = BUS_CLOSE;
 		direction_write();
 		address_set(address);
+#if PCB_REVISION == 1
+		BUS_CONTROL_OUT = bit_get_negative(ADDRESS_HIGH_LATCH) & bit_get_negative(CPU_ROMCS)) | (1 << CPU_PHI2);
+#endif
+#if PCB_REVISION == 2
 		BUS_CONTROL_OUT = bit_get_negative(CPU_ROMCS) | (1 << CPU_PHI2);
+#endif
 		direction_read();
 		if(DATABUS_IN != *data){
 			BUS_CONTROL_OUT = BUS_CLOSE;
@@ -300,7 +320,12 @@ enum compare_status ppu_compare(uint16_t address, uint16_t length, const uint8_t
 	while(length != 0){
 		direction_write();
 		address_set(address);
+#if PCB_REVISION == 1
+		BUS_CONTROL_OUT = bit_get_negative(ADDRESS_HIGH_LATCH) & bit_get_negative(PPU_RD) & bit_get_negative(CPU_PHI2);;
+#endif
+#if PCB_REVISION == 2
 		BUS_CONTROL_OUT = bit_get_negative(PPU_RD) & bit_get_negative(CPU_PHI2);;
+#endif
 		direction_read();
 		if(DATABUS_IN != *data){
 			BUS_CONTROL_OUT = BUS_CLOSE;
@@ -323,7 +348,12 @@ void cpu_write_6502_nowait(uint16_t address, uint16_t length, const uint8_t *dat
 		address_set(address);
 		
 		//phi2 down
+#if PCB_REVISION == 1
+		control = bit_get_negative(ADDRESS_HIGH_LATCH) & bit_get_negative(CPU_RW) & bit_get_negative(CPU_PHI2);
+#endif
+#if PCB_REVISION == 2
 		control = bit_get_negative(CPU_RW) & bit_get_negative(CPU_PHI2);
+#endif
 		BUS_CONTROL_OUT = control;
 		
 		//phi2 up
@@ -368,7 +398,12 @@ D0-D7 |----<iii>---
 */
 static inline void cpu_write_flash_waveform(uint16_t address, uint8_t data)
 {
-	uint8_t control = bit_get_negative(CPU_PHI2);
+#if PCB_REVISION == 1
+        uint8_t control = bit_get_negative(ADDRESS_HIGH_LATCH) & bit_get_negative(CPU_PHI2);
+#endif
+#if PCB_REVISION == 2
+        uint8_t control = bit_get_negative(CPU_PHI2);
+#endif
 	address_set(address);
 	if(0){ //R/W = /WE controlled write operation
 		if((address & 0x8000) != 0){
@@ -429,7 +464,12 @@ void cpu_write_6502(uint16_t address, uint16_t length, const uint8_t *data)
 		address_set(address);
 		
 		//phi2 down
+#if PCB_REVISION == 1
+		control = bit_get_negative(ADDRESS_HIGH_LATCH) & bit_get_negative(CPU_RW) & bit_get_negative(CPU_PHI2);
+#endif
+#if PCB_REVISION == 2
 		control = bit_get_negative(CPU_RW) & bit_get_negative(CPU_PHI2);
+#endif
 		BUS_CONTROL_OUT = control;
 		clock_wait(1);
 
@@ -466,7 +506,12 @@ void cpu_write_6502(uint16_t address, uint16_t length, const uint8_t *data)
 static inline void ppu_write_waveform(uint16_t address, uint8_t data)
 {
 	address_set(address);//PPU charcter memory /CS open
+#if PCB_REVISION == 1
+	BUS_CONTROL_OUT = bit_get_negative(ADDRESS_HIGH_LATCH) & bit_get_negative(PPU_WR) & bit_get_negative(CPU_PHI2);
+#endif
+#if PCB_REVISION == 2
 	BUS_CONTROL_OUT = bit_get_negative(PPU_WR) & bit_get_negative(CPU_PHI2);
+#endif
 	DATABUS_OUT = data;
 	BUS_CONTROL_OUT = BUS_CLOSE;
 	address_set(0x3fff); ///CS close, use pallete area. When address bus is 0x2000-0x2fff, some cartriges enable tilemap area.
@@ -525,21 +570,21 @@ static void boot_address_set(uint16_t address)
 		high |= 0x80; //set /A13
 	}
 	DATABUS_OUT = high;
-	BUS_CONTROL_OUT = bit_get_negative(ADDRESS_HIGH_LATCH) & bit_get_negative(CPU_PHI2);
+	BUS_CONTROL_OUT = bit_get_negative(CPU_PHI2);
 	BUS_CONTROL_OUT = BUS_CLOSE;
 #endif
 #if PCB_REVISION == 2
 	const uint8_t portb = 0x05;
 	DATABUS_OUT = address & 0xff;
-	asm("cbi %0,%1" : :"M"(portb),"M"(ADDRESS_LOW_LATCH));
 	asm("sbi %0,%1" : :"M"(portb),"M"(ADDRESS_LOW_LATCH));
+	asm("cbi %0,%1" : :"M"(portb),"M"(ADDRESS_LOW_LATCH));
 	uint8_t high = (address & 0x7fff) >> 8; //mask A0-A14
 	if((address & (1 << 13)) == 0){ //if A13 == 0
 		high |= 0x80; //set /A13
 	}
 	DATABUS_OUT = high;
-	asm("cbi %0,%1" : :"M"(portb),"M"(ADDRESS_HIGH_LATCH));
 	asm("sbi %0,%1" : :"M"(portb),"M"(ADDRESS_HIGH_LATCH));
+	asm("cbi %0,%1" : :"M"(portb),"M"(ADDRESS_HIGH_LATCH));
 #endif
 }
 
@@ -550,7 +595,12 @@ void mcu_programdata_read(uint16_t address, uint16_t length, uint8_t *data)
 		direction_write();
 		if(address < 0x2000){ //PPU CHR-RAM
 			boot_address_set(address);
+#if PCB_REVISION == 1
+			BUS_CONTROL_OUT = bit_get_negative(ADDRESS_HIGH_LATCH) & bit_get_negative(PPU_RD) & bit_get_negative(CPU_PHI2);
+#endif
+#if PCB_REVISION == 2
 			BUS_CONTROL_OUT = bit_get_negative(PPU_RD) & bit_get_negative(CPU_PHI2);
+#endif
 		}else{ //CPU W-RAM
 			address &= 0x1fff;
 			address |= 0x6000;
