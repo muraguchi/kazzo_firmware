@@ -6,6 +6,8 @@ firmware version 0.1.3 / 2010.03.13
 
 some fix to compile on avr-gcc 9.2.0 by muraguchi
 
+Changed addr latch's default clock level "low". 74HC573 can be used as 74HC574. I checked it on PCB 1.x.
+
 ## features
 
 - USB-to-PC communication
