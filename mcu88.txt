@@ -8,7 +8,7 @@ ATmega168: low byte 0xee, high byte 0xdf, extended byte 0xff
 #    |name
 -----+-------------------
 U1   |ATmega168(P)
-U2,U3|74HC574
+U2,U3|74HC574 or 74HC573(not tested)
 CN1  |type B female USB socket
 CN2  |3x2 pin header, 2.54 mm spacing
 CN3  |30x2 pin cardedge connector, 2.54 mm spacing

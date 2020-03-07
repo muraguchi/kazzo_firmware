@@ -11,7 +11,7 @@ ATmega16:  low byte 0xae, high byte 0xc9
 #    |name
 -----+-------------------
 U1   |ATmega164P or ATmega16
-U2   |74HC574
+U2   |74HC574 or 74HC573
 CN1  |type B female USB socket
 CN2  |3x2 pin header, 2.54 mm spacing
 CN3  |30x2 pin cartridge connector, 2.54 mm spacing
@@ -39,7 +39,7 @@ CN3: cartridge connector CN1: USB socket type B
   CPU A6| 7 37|CPU D6       SCK|3 4|MOSI       MOSI/D5| 6 35|A5
   CPU A5| 8 38|CPU D5    Reset#|5 6|GND        MISO/D6| 7 34|A6
   CPU A4| 9 39|CPU D4          +---+            SCK/D7| 8 33|A7
-  CPU A3|10 40|CPU D3     U2: 74HC574           Reset#| 9 32|+5V
+  CPU A3|10 40|CPU D3     U2: 74HC574/74HC573   Reset#| 9 32|+5V
   CPU A2|11 41|CPU D2         +--v--+              Vcc|10 31|GND
   CPU A1|12 42|CPU D1      GND| 1 20|Vcc           GND|11 30|+5V
   CPU A0|13 43|CPU D0       D0| 2 19|A8          XTAL1|12 29|AHL

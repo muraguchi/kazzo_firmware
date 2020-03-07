@@ -18,7 +18,7 @@ connected CPU and PPU databus*/
 #define ADDRESSBUS_A0_A7_DIR IO_DIRECTION(A)
 #define ADDRESSBUS_A0_A7_OUT IO_OUT(A)
 /* PBx: output/input
-connected address high latch(HC573), CPU and PPU databus*/
+connected address high latch(HC574/HC573), CPU and PPU databus*/
 #define DATABUS_DIR IO_DIRECTION(B)
 #define DATABUS_OUT IO_OUT(B)
 #define DATABUS_IN IO_IN(B)
@@ -296,7 +296,7 @@ enum compare_status cpu_compare(uint16_t address, uint16_t length, const uint8_t
 		direction_write();
 		address_set(address);
 #if PCB_REVISION == 1
-		BUS_CONTROL_OUT = bit_get_negative(ADDRESS_HIGH_LATCH) & bit_get_negative(CPU_ROMCS)) | (1 << CPU_PHI2);
+		BUS_CONTROL_OUT = (bit_get_negative(ADDRESS_HIGH_LATCH) & bit_get_negative(CPU_ROMCS)) | (1 << CPU_PHI2);
 #endif
 #if PCB_REVISION == 2
 		BUS_CONTROL_OUT = bit_get_negative(CPU_ROMCS) | (1 << CPU_PHI2);
